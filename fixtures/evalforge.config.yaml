@@ -1,0 +1,34 @@
+project:
+  id: "test_proj_001"
+  version: "0.1.0"
+
+secrets:
+  provider: env
+
+auth:
+  methods:
+    - type: api_key
+      header: "X-API-Key"
+
+llm:
+  model: "anthropic/claude-haiku-4-5"
+
+database:
+  url: "sqlite+aiosqlite:///./data/app.db"
+
+storage:
+  type: local
+  path: "./data/files"
+
+processes:
+  email-categorizer:
+    process_id: "proc_001"
+    instructions: |
+      You are an email categorizer. Given an email subject and body,
+      categorize it and assign a priority score.
+
+      Respond with JSON: {"category": "...", "priority": N}
+      Categories: inquiry, complaint, spam, invoice, other
+      Priority: 1-10 (10 = most urgent)
+    trigger:
+      type: webhook

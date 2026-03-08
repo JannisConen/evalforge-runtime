@@ -24,10 +24,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
-[project.urls]
-Homepage = "https://github.com/JannisConen/evalforge-runtime"
-Repository = "https://github.com/JannisConen/evalforge-runtime"
-Issues = "https://github.com/JannisConen/evalforge-runtime/issues"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
@@ -41,6 +37,11 @@ dependencies = [
     "python-multipart>=0.0.18",
     "python-dotenv>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/JannisConen/evalforge-runtime"
+Repository = "https://github.com/JannisConen/evalforge-runtime"
+Issues = "https://github.com/JannisConen/evalforge-runtime/issues"
 
 [project.optional-dependencies]
 exchange = ["httpx>=0.28.0"]

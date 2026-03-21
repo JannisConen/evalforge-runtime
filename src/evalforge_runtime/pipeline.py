@@ -102,6 +102,10 @@ class Pipeline:
                     source_execution_id=trigger.source_execution_id,
                 )
 
+        logger.info(
+            "Starting pipeline for '%s' (execution=%s), input_data=%s",
+            process_name, execution_id, input_data,
+        )
         start = time.monotonic()
 
         try:
@@ -110,6 +114,10 @@ class Pipeline:
                 process_name, proc_config, modules, input_data, trigger, execution_id
             )
             duration_ms = int((time.monotonic() - start) * 1000)
+            logger.info(
+                "Execution step done for '%s' in %dms, output=%s",
+                process_name, duration_ms, output,
+            )
 
             # Store LLM tracking data
             if llm_tracking:
@@ -134,8 +142,21 @@ class Pipeline:
             # --- AFTER step ---
             after_mod = modules.get("after")
             if after_mod:
+                logger.info(
+                    "Running after step for '%s', trigger=%s, output=%s",
+                    process_name, trigger, output,
+                )
                 try:
+                    # Inject runtime context for ActionRunner-based after modules
+                    after_mod.config["secrets"] = self.secrets
+                    after_mod.config["session_factory"] = session_factory
+                    after_mod.config["execution_id"] = execution_id
+                    after_mod.config["context"] = {
+                        "initiator": proc_config.connector_params or {},
+                        "process": {"name": process_name, "id": proc_config.process_id},
+                    }
                     await after_mod.execute(trigger, output)
+                    logger.info("After step completed for '%s'", process_name)
                 except Exception as e:
                     logger.error(f"After step failed for '{process_name}': {e}")
                     # After errors are logged but don't fail the execution
@@ -188,18 +209,28 @@ class Pipeline:
         """
         execution_mod: Execution | None = modules.get("execution")
 
-        # Resolve instructions: file-based (instructions.md) takes priority over config
-        instructions = modules.get("instructions") or proc_config.instructions or None
+        # Resolve prompts: file-based (prompts/ dir) takes priority, then config fallback
+        prompts: dict[str, str] = dict(modules.get("prompts", {}))
+        if not prompts.get("system") and proc_config.instructions:
+            prompts["system"] = proc_config.instructions
+        instructions = prompts.get("system")
 
         # Resolve output schema: file-based (execution_output_schema.py) takes priority over config
         output_schema_model: type | None = modules.get("output_schema")
 
+        logger.info(
+            "Running execution for '%s': custom_module=%s, has_instructions=%s, prompt_count=%d, input=%s",
+            process_name, execution_mod is not None, instructions is not None,
+            len(prompts), input_data,
+        )
+
         if execution_mod:
             # Custom execution module
+            logger.info("Using custom execution module for '%s'", process_name)
             llm_client = LLMClient(proc_config.llm_model or self.config.llm.model)
             context = ExecutionContext(
                 llm=llm_client,
-                instructions=instructions,
+                prompts=prompts,
                 output_schema=output_schema_model,
                 secrets=self.secrets,
                 storage=self.storage,
@@ -208,6 +239,7 @@ class Pipeline:
                 trigger=trigger,
             )
             output = await execution_mod.run(input_data, context)
+            logger.info("Custom execution output for '%s': %s", process_name, output)
 
             # Extract LLM tracking from the client (accumulated across all calls)
             llm_tracking = None
@@ -223,11 +255,15 @@ class Pipeline:
             return output, llm_tracking
         else:
             # Default LLM execution
+            logger.info(
+                "Using default LLM execution for '%s', model=%s",
+                process_name, proc_config.llm_model or self.config.llm.model,
+            )
             if not instructions:
                 raise ValueError(
-                    f"Process '{process_name}' has no instructions.md and no instructions configured. "
-                    "Either provide an instructions.md file, inline instructions in the config, "
-                    "or an execution module."
+                    f"Process '{process_name}' has no system prompt configured. "
+                    "Provide a prompts/system.md file, inline instructions in the config, "
+                    "or a custom execution module."
                 )
 
             result = await self.executor.execute(
@@ -261,6 +297,10 @@ class Pipeline:
         if not downstream:
             return
 
+        logger.info(
+            "Triggering %d downstream processes from '%s': %s",
+            len(downstream), source_process, downstream,
+        )
         source_data = {"input": source_input, "output": source_output}
 
         for ds_name in downstream:
@@ -270,6 +310,10 @@ class Pipeline:
             try:
                 # Apply before step if present
                 if before_mod:
+                    logger.info(
+                        "Running before step for downstream '%s', source_data keys=%s",
+                        ds_name, list(source_data.keys()),
+                    )
                     # Check condition
                     if not before_mod.condition(source_data):
                         logger.info(
@@ -284,6 +328,7 @@ class Pipeline:
                     else:
                         # Pydantic model
                         ds_input = prepared.model_dump() if hasattr(prepared, "model_dump") else dict(prepared)
+                    logger.info("Before step for '%s' prepared input: %s", ds_name, ds_input)
                 else:
                     # No before module — pass source output as input
                     ds_input = source_output
@@ -349,6 +394,13 @@ class Pipeline:
                 source_execution_id=source_execution_id,
             )
             try:
+                after_mod.config["secrets"] = self.secrets
+                after_mod.config["session_factory"] = get_session_factory()
+                after_mod.config["execution_id"] = execution_id
+                after_mod.config["context"] = {
+                    "initiator": proc_config.connector_params or {},
+                    "process": {"name": process_name, "id": proc_config.process_id},
+                }
                 await after_mod.execute(trigger, output)
             except Exception as e:
                 logger.error(f"After step failed for '{process_name}': {e}")
@@ -465,10 +517,10 @@ def _load_process_modules(
         except Exception as e:
             logger.error(f"Error loading {step} module for '{process_name}': {e}")
 
-    # Load instructions from file
-    instructions = _load_instructions(module_base)
-    if instructions:
-        modules["instructions"] = instructions
+    # Load prompts from prompts/ directory (or legacy instructions.md)
+    prompts = _load_prompts(module_base)
+    if prompts:
+        modules["prompts"] = prompts
 
     # Load output schema Pydantic model
     output_schema_model = _load_output_schema(module_base)
@@ -478,19 +530,37 @@ def _load_process_modules(
     return modules
 
 
-def _load_instructions(module_base: str) -> str | None:
-    """Load instructions from processes/{name}/instructions.md."""
+def _load_prompts(module_base: str) -> dict[str, str]:
+    """Load all .md files from processes/{name}/prompts/ as named prompts.
+
+    Falls back to legacy instructions.md for backward compatibility.
+    """
     from pathlib import Path
 
-    # Try common base paths
+    prompts: dict[str, str] = {}
+
+    # Try prompts/ directory first
     for base in [Path.cwd(), Path(".")]:
-        instructions_path = base / "processes" / module_base / "instructions.md"
-        if instructions_path.exists():
-            text = instructions_path.read_text(encoding="utf-8").strip()
+        prompts_dir = base / "processes" / module_base / "prompts"
+        if prompts_dir.is_dir():
+            for f in sorted(prompts_dir.glob("*.md")):
+                text = f.read_text(encoding="utf-8").strip()
+                if text:
+                    prompts[f.stem] = text
+            if prompts:
+                logger.info(f"Loaded {len(prompts)} prompt(s) from {prompts_dir}: {list(prompts.keys())}")
+                return prompts
+
+    # Backward compat: try legacy instructions.md
+    for base in [Path.cwd(), Path(".")]:
+        old_path = base / "processes" / module_base / "instructions.md"
+        if old_path.exists():
+            text = old_path.read_text(encoding="utf-8").strip()
             if text:
-                logger.info(f"Loaded instructions from {instructions_path}")
-                return text
-    return None
+                logger.info(f"Loaded legacy instructions from {old_path} as prompts['system']")
+                return {"system": text}
+
+    return {}
 
 
 def _load_output_schema(module_base: str) -> type | None:

@@ -93,6 +93,23 @@ class ExecutionRecord(Base):
         }
 
 
+class ActionLog(Base):
+    """Log of each action execution within a process run."""
+
+    __tablename__ = "action_logs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    execution_id = Column(String, nullable=False, index=True)
+    action_type = Column(String, nullable=False)
+    action_index = Column(Integer, nullable=False)
+    status = Column(String, nullable=False)  # "success", "error", "skipped"
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    action_metadata = Column("metadata", Text, nullable=True)  # JSON
+
+
 # Global engine and session factory
 _engine = None
 _session_factory = None
@@ -211,6 +228,21 @@ async def list_executions(
     query = query.limit(limit).offset(offset)
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def trigger_ref_exists(
+    session: AsyncSession, process_name: str, trigger_ref: str
+) -> bool:
+    """Check if a trigger_ref has already been processed for a given process."""
+    result = await session.execute(
+        select(ExecutionRecord.id)
+        .where(
+            ExecutionRecord.process_name == process_name,
+            ExecutionRecord.trigger_ref == trigger_ref,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def get_last_execution_time(

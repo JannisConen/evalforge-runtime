@@ -6,6 +6,15 @@ __version__ = "0.1.0"
 def main() -> None:
     """CLI entry point: evalforge-runtime start --config <path>"""
     import argparse
+    import logging
+    import os
+
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     from evalforge_runtime.config import load_config
     from evalforge_runtime.server import create_app

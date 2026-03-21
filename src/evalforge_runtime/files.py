@@ -116,8 +116,6 @@ async def _resolve_single(
     if content is None and ref.get("key"):
         try:
             content = await storage.get(ref["key"])
-            # Already stored — use the existing key
-            local_key = ref["key"]
         except FileNotFoundError:
             pass
 

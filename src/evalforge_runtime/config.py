@@ -65,6 +65,13 @@ class TriggerConfig(BaseModel):
     after: str | None = None
 
 
+class TriggerFilterConfig(BaseModel):
+    mode: Literal["always", "visual", "python"] = "always"
+    groups: list[dict[str, Any]] | None = None
+    group_logic: Literal["and", "or"] = "and"
+    code: str | None = None
+
+
 class ProcessConfig(BaseModel):
     process_id: str
     instructions: str = ""
@@ -73,10 +80,12 @@ class ProcessConfig(BaseModel):
     connector_params: dict[str, Any] | None = None
     review: ReviewConfig = ReviewConfig()
     llm_model: str | None = None
+    input_schema: dict[str, str] | None = None
     output_schema: dict[str, str] | None = None
     before_module: str | None = None
     execution_module: str | None = None
     after_module: str | None = None
+    trigger_filter: TriggerFilterConfig | None = None
 
 
 class DatabaseConfig(BaseModel):
@@ -90,6 +99,11 @@ class StorageConfig(BaseModel):
     region: str | None = None
 
 
+class UIConfig(BaseModel):
+    enabled: bool = True
+    path: str = "/ui"
+
+
 class AppConfig(BaseModel):
     project: ProjectConfig
     secrets: SecretConfig = SecretConfig()
@@ -98,7 +112,9 @@ class AppConfig(BaseModel):
     database: DatabaseConfig = DatabaseConfig()
     storage: StorageConfig = StorageConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
+    ui: UIConfig = UIConfig()
     processes: dict[str, ProcessConfig] = {}
+    max_concurrent_executions: int = int(os.environ.get("MAX_CONCURRENT_EXECUTIONS", "10"))
 
 
 def _parse_duration(duration_str: str) -> int:

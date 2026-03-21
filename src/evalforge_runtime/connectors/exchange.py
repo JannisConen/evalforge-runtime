@@ -12,13 +12,15 @@ Required secrets:
 from __future__ import annotations
 
 import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
 from evalforge_runtime.connectors.base import Connector, ConnectorItem
 from evalforge_runtime.storage import LocalStorage
-from evalforge_runtime.types import FileRef
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,9 @@ class ExchangeConnector(Connector):
         self._mailbox = self.params.get("mailbox", "")
         self._folder = self.params.get("folder", "Inbox")
         self._filter = self.params.get("filter", "unread")
+        self._max_age_minutes = int(
+            self.params.get("maxAgeMinutes", os.environ.get("EMAIL_MAX_AGE_MINUTES", "1440"))
+        )
 
     def name(self) -> str:
         return "exchange-inbox"
@@ -77,7 +82,14 @@ class ExchangeConnector(Connector):
         token = await self._acquire_token()
         headers = {"Authorization": f"Bearer {token}"}
 
-        filter_str = "$filter=isRead eq false" if self._filter == "unread" else ""
+        # Build OData filter with date constraint
+        since = (datetime.now(timezone.utc) - timedelta(minutes=self._max_age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        filters: list[str] = [f"receivedDateTime ge {since}"]
+        if self._filter == "unread":
+            filters.append("isRead eq false")
+        filter_str = "$filter=" + " and ".join(filters)
+        logger.debug("Exchange fetch filter: %s", filter_str)
+
         url = (
             f"https://graph.microsoft.com/v1.0/users/{self._mailbox}"
             f"/mailFolders/{self._folder}/messages?{filter_str}&$top=50"
@@ -89,73 +101,54 @@ class ExchangeConnector(Connector):
             messages = resp.json().get("value", [])
 
         items: list[ConnectorItem] = []
-        for msg in messages:
-            attachments: list[FileRef] = []
-            if msg.get("hasAttachments") and self.storage:
-                attachments = await self._fetch_attachments(
-                    msg["id"], headers, msg["id"]
-                )
-
-            items.append(ConnectorItem(
-                ref=msg["id"],
-                data={
+        async with httpx.AsyncClient() as client:
+            for msg in messages:
+                data: dict[str, Any] = {
                     "email_subject": msg.get("subject", ""),
                     "email_body": msg.get("body", {}).get("content", ""),
                     "sender": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
                     "received_at": msg.get("receivedDateTime", ""),
-                },
-                attachments=attachments,
-            ))
+                    "has_attachments": msg.get("hasAttachments", False),
+                }
+
+                # Download raw MIME as .eml file (skip if already saved)
+                if self.storage:
+                    try:
+                        subject_slug = _slugify(msg.get("subject", "email"))[:60]
+                        eml_filename = f"{subject_slug}.eml"
+                        eml_key = f"connector/exchange/{msg['id']}/{eml_filename}"
+                        if not await self.storage.exists(eml_key):
+                            mime_resp = await client.get(
+                                f"https://graph.microsoft.com/v1.0/users/{self._mailbox}"
+                                f"/messages/{msg['id']}/$value",
+                                headers=headers,
+                            )
+                            mime_resp.raise_for_status()
+                            raw_bytes = mime_resp.content
+                            await self.storage.put(eml_key, raw_bytes, "message/rfc822")
+                            eml_size = len(raw_bytes)
+                            logger.info("Saved .eml file: %s (%d bytes)", eml_key, eml_size)
+                        else:
+                            eml_size = await self.storage.size(eml_key)
+                        data["file"] = {
+                            "type": "local",
+                            "key": eml_key,
+                            "filename": eml_filename,
+                            "size": eml_size,
+                            "mimeType": "message/rfc822",
+                            "extension": "eml",
+                        }
+                    except Exception as e:
+                        logger.warning("Failed to download .eml for message %s: %s", msg["id"], e)
+
+                items.append(ConnectorItem(ref=msg["id"], data=data))
 
         return items
-
-    async def _fetch_attachments(
-        self, message_id: str, headers: dict, execution_ref: str
-    ) -> list[FileRef]:
-        """Fetch and store attachments for a message."""
-        if not self.storage:
-            return []
-
-        url = (
-            f"https://graph.microsoft.com/v1.0/users/{self._mailbox}"
-            f"/messages/{message_id}/attachments"
-        )
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            attachments_data = resp.json().get("value", [])
-
-        refs: list[FileRef] = []
-        for att in attachments_data:
-            if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
-                continue
-
-            import base64
-            content = base64.b64decode(att.get("contentBytes", ""))
-            filename = att.get("name", "attachment")
-            extension = filename.rsplit(".", 1)[-1] if "." in filename else ""
-            mime_type = att.get("contentType", "application/octet-stream")
-            key = f"connector/exchange/{execution_ref}/{filename}"
-
-            await self.storage.put(key, content, mime_type)
-
-            refs.append(FileRef(
-                type="local",
-                key=key,
-                filename=filename,
-                size=len(content),
-                mimeType=mime_type,
-                extension=extension,
-            ))
-
-        return refs
 
     # --- Output methods (used by after steps) ---
 
     async def send_message(
         self, to: list[str], subject: str, body: str,
-        attachments: list[FileRef] | None = None,
     ) -> str:
         """Send a new email. Returns message ID."""
         token = await self._acquire_token()
@@ -253,3 +246,11 @@ class ExchangeConnector(Connector):
             )
             resp.raise_for_status()
             return resp.json()["id"]
+
+
+def _slugify(text: str) -> str:
+    """Convert text to a filesystem-safe slug."""
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "-", text)
+    return text.strip("-") or "email"

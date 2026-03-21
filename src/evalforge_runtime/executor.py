@@ -59,6 +59,14 @@ class Executor:
         model = model_override or self.default_model
         instructions_hash = hashlib.sha256(instructions.encode()).hexdigest()[:16]
 
+        logger.info(
+            "LLM execute: model=%s, process=%s, instructions_hash=%s, input_data=%s",
+            model, process_name, instructions_hash, input_data,
+        )
+        logger.info(
+            "LLM system prompt (first 500 chars): %.500s", instructions,
+        )
+
         # Build response_format and system prompt
         if output_schema is not None:
             if isinstance(output_schema, type):
@@ -91,8 +99,17 @@ class Executor:
         latency_ms = int((time.monotonic() - start) * 1000)
 
         content = response.choices[0].message.content
+        logger.info("LLM raw response for '%s' (%dms): %s", process_name, latency_ms, content)
+
         output = json.loads(content)
         usage = response.usage
+
+        logger.info(
+            "LLM parsed output for '%s': %s | tokens_in=%s, tokens_out=%s",
+            process_name, output,
+            usage.prompt_tokens if usage else None,
+            usage.completion_tokens if usage else None,
+        )
 
         # Cost from LiteLLM's built-in model pricing
         cost: float | None = None
@@ -100,6 +117,8 @@ class Executor:
             cost = litellm.completion_cost(completion_response=response)
         except Exception:
             pass  # model may not have pricing info
+
+        logger.info("LLM cost for '%s': $%s", process_name, cost)
 
         return ExecutionResult(
             output=output,

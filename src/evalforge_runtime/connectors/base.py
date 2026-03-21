@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
-
-from evalforge_runtime.types import FileRef
 
 
 @dataclass
 class ConnectorItem:
-    """A single item fetched by a connector (e.g., one email)."""
+    """A single item fetched by a connector (e.g., one email).
+
+    Files go as FileRef dicts in data["file"] so they match the API webhook format.
+    """
 
     ref: str  # unique identifier (e.g., email message ID)
-    data: dict[str, Any]  # the item's data fields
-    attachments: list[FileRef] = field(default_factory=list)
+    data: dict[str, Any]
 
 
 class Connector(ABC):

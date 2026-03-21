@@ -1,7 +1,6 @@
 """FastAPI application factory and route registration."""
 
-from __future__ import annotations
-
+import asyncio
 import json
 import logging
 import os
@@ -24,6 +23,7 @@ from evalforge_runtime.db import (
     get_session_factory,
     init_db,
     list_executions,
+    trigger_ref_exists,
     update_execution,
 )
 from evalforge_runtime.executor import Executor
@@ -81,9 +81,15 @@ def create_app(config: AppConfig) -> FastAPI:
         pipeline.discover_modules()
         app.state.pipeline = pipeline
 
+        # Concurrency limiter
+        max_concurrent = config.max_concurrent_executions
+        semaphore = asyncio.Semaphore(max_concurrent)
+        app.state.execution_semaphore = semaphore
+        logger.info("Max concurrent executions: %d", max_concurrent)
+
         # Start scheduler and register cron jobs
         await scheduler.start()
-        _register_scheduled_jobs(config, scheduler, pipeline, connectors)
+        _register_scheduled_jobs(config, scheduler, pipeline, connectors, semaphore, storage)
 
         # Register review expiration job (every minute)
         if any(p.review.enabled for p in config.processes.values()):
@@ -104,6 +110,38 @@ def create_app(config: AppConfig) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.pipeline = None  # Set during lifespan, or injected in tests
+
+    # Mount Gradio demo UI (if enabled and gradio is installed).
+    # MUST be outside lifespan — Gradio's queue worker starts via ASGI
+    # startup events, which only fire if mounted before the app starts.
+    if config.ui.enabled:
+        try:
+            import gradio as gr
+
+            from evalforge_runtime.ui import create_demo, get_gradio_auth
+
+            demo = create_demo(config, pipeline=None)
+            demo.api_open = False
+            demo.queue(default_concurrency_limit=40)
+
+            auth_fn = get_gradio_auth(config)
+            mount_kwargs: dict[str, Any] = {}
+            if auth_fn:
+                mount_kwargs["auth"] = auth_fn
+                mount_kwargs["auth_message"] = (
+                    "Enter any username and your API key as password"
+                )
+            gr.mount_gradio_app(
+                app, demo, path=config.ui.path,
+                show_error=True,
+                **mount_kwargs,
+            )
+            logger.info("Demo UI mounted at %s", config.ui.path)
+        except ImportError:
+            logger.info(
+                "Gradio not installed — demo UI disabled. "
+                "Install with: pip install evalforge-runtime[ui]"
+            )
 
     # --- Health endpoint (no auth) ---
 
@@ -140,6 +178,7 @@ def create_app(config: AppConfig) -> FastAPI:
         _register_process_route(
             app, process_name, process_config, executor, storage, auth_dep, config,
             lambda: app.state.pipeline,
+            lambda: getattr(app.state, "execution_semaphore", None),
         )
 
     # --- Execution endpoints (authenticated) ---
@@ -313,6 +352,7 @@ def _make_process_handler(
     auth_dep: APIKeyAuth,
     config: AppConfig,
     get_pipeline,
+    get_semaphore=None,
 ):
     """Create a process endpoint handler with properly captured closure variables."""
 
@@ -344,25 +384,33 @@ def _make_process_handler(
             from evalforge_runtime.types import TriggerContext
 
             trigger = TriggerContext(type="webhook", ref=execution_id)
+            semaphore = get_semaphore() if get_semaphore else None
             try:
-                output = await pl.execute_process(
-                    process_name, input_data, trigger, execution_id
-                )
+                if semaphore:
+                    async with semaphore:
+                        output = await pl.execute_process(
+                            process_name, input_data, trigger, execution_id
+                        )
+                else:
+                    output = await pl.execute_process(
+                        process_name, input_data, trigger, execution_id
+                    )
                 return output or {}
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=str(exc))
 
         # Fallback: direct LLM execution (Phase 1 mode)
-        # Load instructions from file first, fall back to config
-        from evalforge_runtime.pipeline import _load_instructions, _load_output_schema
+        # Load prompts from prompts/ dir, fall back to legacy instructions.md, then config
+        from evalforge_runtime.pipeline import _load_prompts, _load_output_schema
 
         module_base = process_name.replace("-", "_")
-        instructions = _load_instructions(module_base) or process_config.instructions
+        prompts = _load_prompts(module_base)
+        instructions = prompts.get("system") or process_config.instructions
         if not instructions:
             raise HTTPException(
                 status_code=501,
-                detail="No instructions configured for this process. "
-                "Add instructions.md or configure instructions in the EvalForge UI and re-generate.",
+                detail="No system prompt configured for this process. "
+                "Add prompts/system.md or configure instructions in the config.",
             )
 
         output_schema_model = _load_output_schema(module_base)
@@ -434,11 +482,13 @@ def _register_process_route(
     auth_dep: APIKeyAuth,
     config: AppConfig,
     get_pipeline=None,
+    get_semaphore=None,
 ) -> None:
     """Register a POST /process/{name} endpoint for a process."""
     handler = _make_process_handler(
         process_name, process_config, executor, storage, auth_dep, config,
         get_pipeline or (lambda: None),
+        get_semaphore,
     )
     app.add_api_route(
         f"/process/{process_name}",
@@ -458,8 +508,11 @@ async def _parse_multipart(
     input_data: dict[str, Any] = {}
     file_refs: list[dict[str, Any]] = []
 
-    for field_name, field_value in form.items():
-        if isinstance(field_value, UploadFile):
+    for field_name, field_value in form.multi_items():
+        # Duck-type check: UploadFile has .read() and .filename.
+        # Cannot use isinstance() — FastAPI and Starlette may load
+        # different UploadFile classes depending on install.
+        if hasattr(field_value, "read") and hasattr(field_value, "filename"):
             file_ref = await process_uploaded_file(
                 field_value, execution_id, storage
             )
@@ -479,6 +532,7 @@ async def _parse_multipart(
         else:
             input_data["files"] = file_refs
 
+    await form.close()
     return input_data
 
 
@@ -513,16 +567,27 @@ def _register_scheduled_jobs(
     scheduler: Scheduler,
     pipeline: Pipeline,
     connectors: dict[str, Any],
+    semaphore: asyncio.Semaphore,
+    storage: LocalStorage | None = None,
 ) -> None:
     """Register cron-triggered jobs for scheduled processes."""
     for pname, pconfig in config.processes.items():
         if pconfig.trigger.type == "schedule" and pconfig.trigger.cron:
             connector = connectors.get(pname)
 
+            # Capture filter config at registration time
+            _filter = (
+                pconfig.trigger_filter.model_dump(exclude_none=True)
+                if pconfig.trigger_filter
+                else None
+            )
+
             async def _scheduled_run(
                 _pname: str = pname,
                 _connector: Any = connector,
+                _tf: dict[str, Any] | None = _filter,
             ) -> None:
+                from evalforge_runtime.condition import evaluate_condition
                 from evalforge_runtime.types import TriggerContext
 
                 if _connector:
@@ -534,45 +599,55 @@ def _register_scheduled_jobs(
                         return
 
                     for item in items:
-                        # Deduplication: check if already processed
-                        session_factory = get_session_factory()
-                        async with session_factory() as session:
-                            existing = await list_executions(
-                                session,
-                                process_name=_pname,
-                                limit=1,
-                            )
-                            # Simple dedup by trigger_ref
-                            if existing and any(
-                                e.trigger_ref == item.ref for e in existing
-                            ):
+                        # Deduplication: check if trigger_ref already processed
+                        if item.ref:
+                            session_factory = get_session_factory()
+                            async with session_factory() as session:
+                                if await trigger_ref_exists(session, _pname, item.ref):
+                                    logger.debug(
+                                        "Skipping already-processed item '%s' for '%s'",
+                                        item.ref, _pname,
+                                    )
+                                    continue
+
+                        # Apply trigger filter (condition evaluator)
+                        if _tf and _tf.get("mode") != "always":
+                            if not evaluate_condition(_tf, item.data, fn_name="should_process"):
+                                logger.info(
+                                    "Filtered out item ref='%s' for '%s' (filter mode=%s)",
+                                    item.ref, _pname, _tf.get("mode"),
+                                )
                                 continue
 
+                        execution_id = str(uuid4())
                         trigger = TriggerContext(
                             type="schedule", ref=item.ref
                         )
                         input_data = item.data
-                        if item.attachments:
-                            input_data["attachments"] = [
-                                a.model_dump(by_alias=True) for a in item.attachments
-                            ]
 
-                        try:
-                            await pipeline.execute_process(
-                                _pname, input_data, trigger
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Scheduled execution failed for '{_pname}' "
-                                f"(ref: {item.ref}): {e}"
-                            )
+                        # Resolve FileRefs into executions/{id}/ path (same as API webhook)
+                        input_data = await resolve_file_refs(
+                            input_data, execution_id, storage
+                        )
+
+                        async with semaphore:
+                            try:
+                                await pipeline.execute_process(
+                                    _pname, input_data, trigger, execution_id
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"Scheduled execution failed for '{_pname}' "
+                                    f"(ref: {item.ref}): {e}"
+                                )
                 else:
                     # No connector — just trigger with empty input
                     trigger = TriggerContext(type="schedule")
-                    try:
-                        await pipeline.execute_process(_pname, {}, trigger)
-                    except Exception as e:
-                        logger.error(f"Scheduled execution failed for '{_pname}': {e}")
+                    async with semaphore:
+                        try:
+                            await pipeline.execute_process(_pname, {}, trigger)
+                        except Exception as e:
+                            logger.error(f"Scheduled execution failed for '{_pname}': {e}")
 
             scheduler.add_cron_job(
                 job_id=f"process_{pname}",

@@ -73,7 +73,7 @@ class ExecutionContext:
         self,
         *,
         llm: LLMClient,
-        instructions: str | None,
+        prompts: dict[str, str],
         output_schema: type[BaseModel] | None = None,
         secrets: dict[str, str],
         storage: Any,
@@ -82,13 +82,18 @@ class ExecutionContext:
         trigger: TriggerContext,
     ):
         self.llm = llm
-        self.instructions = instructions
+        self.prompts = prompts
         self.output_schema = output_schema
         self.secrets = secrets
         self.storage = storage
         self.process_name = process_name
         self.process_id = process_id
         self.trigger = trigger
+
+    @property
+    def instructions(self) -> str | None:
+        """Backward compat: returns prompts['system'] if it exists."""
+        return self.prompts.get("system")
 
 
 class Execution(ABC):

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 class ProjectConfig(BaseModel):
     id: str
+    active: bool = True  # When false, all processes reject requests
     evalforge_url: str | None = None
     version: str = "0.0.0"
 
@@ -74,6 +75,7 @@ class TriggerFilterConfig(BaseModel):
 
 class ProcessConfig(BaseModel):
     process_id: str
+    active: bool = True  # When false, this process rejects requests
     instructions: str = ""
     trigger: TriggerConfig
     connector: str | None = None

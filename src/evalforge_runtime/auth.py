@@ -33,6 +33,15 @@ class APIKeyAuth:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     def _get_valid_keys(self) -> list[str]:
-        """Get list of valid API keys from environment."""
+        """Get list of valid API keys from environment.
+
+        Includes EVALFORGE_API_KEYS (comma-separated) and EVALFORGE_SERVICE_KEY
+        (project-scoped key for process-to-process calls).
+        """
+        keys: list[str] = []
         raw = os.environ.get("EVALFORGE_API_KEYS", "")
-        return [k.strip() for k in raw.split(",") if k.strip()]
+        keys.extend(k.strip() for k in raw.split(",") if k.strip())
+        service_key = os.environ.get("EVALFORGE_SERVICE_KEY", "").strip()
+        if service_key and service_key not in keys:
+            keys.append(service_key)
+        return keys

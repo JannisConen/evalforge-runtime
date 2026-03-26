@@ -215,7 +215,7 @@ class Pipeline:
             prompts["system"] = proc_config.instructions
         instructions = prompts.get("system")
 
-        # Resolve output schema: file-based (execution_output_schema.py) takes priority over config
+        # Resolve output schema: file-based (output_schema.py) takes priority over config
         output_schema_model: type | None = modules.get("output_schema")
 
         logger.info(
@@ -527,6 +527,11 @@ def _load_process_modules(
     if output_schema_model:
         modules["output_schema"] = output_schema_model
 
+    # Load input schema Pydantic model (for typed API endpoints)
+    input_schema_model = _load_input_schema(module_base)
+    if input_schema_model:
+        modules["input_schema"] = input_schema_model
+
     return modules
 
 
@@ -564,8 +569,8 @@ def _load_prompts(module_base: str) -> dict[str, str]:
 
 
 def _load_output_schema(module_base: str) -> type | None:
-    """Import OutputSchema from processes/{name}/execution_output_schema.py."""
-    module_path = f"processes.{module_base}.execution_output_schema"
+    """Import OutputSchema from processes/{name}/output_schema.py."""
+    module_path = f"processes.{module_base}.output_schema"
     try:
         mod = importlib.import_module(module_path)
         schema_cls = getattr(mod, "OutputSchema", None)
@@ -576,6 +581,22 @@ def _load_output_schema(module_base: str) -> type | None:
         pass
     except Exception as e:
         logger.error(f"Error loading output schema for '{module_base}': {e}")
+    return None
+
+
+def _load_input_schema(module_base: str) -> type | None:
+    """Import InputSchema from processes/{name}/input_schema.py."""
+    module_path = f"processes.{module_base}.input_schema"
+    try:
+        mod = importlib.import_module(module_path)
+        schema_cls = getattr(mod, "InputSchema", None)
+        if schema_cls is not None:
+            logger.info(f"Loaded input schema from {module_path}")
+            return schema_cls
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.error(f"Error loading input schema for '{module_base}': {e}")
     return None
 
 

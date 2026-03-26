@@ -21,6 +21,41 @@ class FileRef(BaseModel):
     extension: str
 
 
+class FileInput(BaseModel):
+    """File input from the EvalForge test runner or trigger.
+
+    Contains file metadata and optionally base64-encoded content.
+    Use ``file_content()`` to decode text or ``file_bytes()`` for raw bytes.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str  # "local", "s3", or "url"
+    key: str  # storage path
+    filename: str  # original filename
+    size: int | None = None
+    mime_type: str | None = Field(default=None, alias="mimeType")
+    extension: str | None = None
+    data: str | None = None  # base64-encoded file content
+    url: str | None = None  # absolute download URL
+
+    def file_content(self, encoding: str = "utf-8") -> str:
+        """Decode base64 data to string."""
+        if not self.data:
+            raise ValueError(f"No data in FileInput for {self.filename}")
+        import base64
+
+        return base64.b64decode(self.data).decode(encoding)
+
+    def file_bytes(self) -> bytes:
+        """Decode base64 data to bytes."""
+        if not self.data:
+            raise ValueError(f"No data in FileInput for {self.filename}")
+        import base64
+
+        return base64.b64decode(self.data)
+
+
 class ExecutionResult(BaseModel):
     """Result from the LLM executor."""
 
@@ -140,6 +175,8 @@ _SCHEMA_TYPE_MAP: dict[str, type] = {
     "number": float,
     "integer": int,
     "boolean": bool,
+    "file": FileInput,
+    "FileRef": FileInput,
 }
 
 

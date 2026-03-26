@@ -353,13 +353,32 @@ def _make_process_handler(
     config: AppConfig,
     get_pipeline,
     get_semaphore=None,
+    input_model: type | None = None,
 ):
-    """Create a process endpoint handler with properly captured closure variables."""
+    """Create a process endpoint handler with properly captured closure variables.
+
+    When input_model (a Pydantic BaseModel) is provided, FastAPI uses it for:
+    - Request body validation
+    - Auto-generated OpenAPI docs with typed fields
+    - The /docs Swagger UI shows the exact input schema
+    """
 
     async def process_endpoint(
         request: Request,
         _auth: str = Depends(auth_dep),
     ) -> dict[str, Any]:
+        # Check if project or process is deactivated
+        if not config.project.active:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Project '{config.project.id}' is deactivated.",
+            )
+        if not process_config.active:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Process '{process_name}' is deactivated.",
+            )
+
         execution_id = str(uuid4())
         content_type = request.headers.get("content-type", "")
 
@@ -368,9 +387,22 @@ def _make_process_handler(
             input_data = await _parse_multipart(request, execution_id, storage)
         else:
             try:
-                input_data = await request.json()
+                body = await request.json()
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+            # Validate against InputSchema if available
+            if input_model and isinstance(body, dict):
+                try:
+                    validated = input_model.model_validate(body)
+                    input_data = validated.model_dump()
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Input validation failed: {e}",
+                    )
+            else:
+                input_data = body
 
         if not isinstance(input_data, dict):
             raise HTTPException(status_code=400, detail="Input must be a JSON object")
@@ -473,6 +505,19 @@ def _make_process_handler(
     return process_endpoint
 
 
+def _load_schema_model(process_name: str, kind: str) -> type | None:
+    """Eagerly load InputSchema or OutputSchema for typed API docs."""
+    module_base = process_name.replace("-", "_")
+    class_name = f"{kind.capitalize()}Schema"
+    module_path = f"processes.{module_base}.{kind}_schema"
+    try:
+        import importlib
+        mod = importlib.import_module(module_path)
+        return getattr(mod, class_name, None)
+    except (ImportError, Exception):
+        return None
+
+
 def _register_process_route(
     app: FastAPI,
     process_name: str,
@@ -484,17 +529,36 @@ def _register_process_route(
     get_pipeline=None,
     get_semaphore=None,
 ) -> None:
-    """Register a POST /process/{name} endpoint for a process."""
+    """Register a POST /process/{name} endpoint for a process.
+
+    Loads InputSchema and OutputSchema from the process directory at registration
+    time. These are self-contained Pydantic models baked into the generated app —
+    no EvalForge API calls needed.
+
+    When available, FastAPI uses them for:
+    - Request body validation (InputSchema)
+    - Response model in OpenAPI docs (OutputSchema)
+    - Typed /docs Swagger UI
+    """
+    input_model = _load_schema_model(process_name, "input")
+    output_model = _load_schema_model(process_name, "output")
     handler = _make_process_handler(
         process_name, process_config, executor, storage, auth_dep, config,
         get_pipeline or (lambda: None),
         get_semaphore,
+        input_model=input_model,
     )
+    route_kwargs: dict[str, Any] = {
+        "methods": ["POST"],
+        "name": f"process_{process_name}",
+        "description": f"Execute the {process_name} process.",
+    }
+    if output_model:
+        route_kwargs["response_model"] = output_model
     app.add_api_route(
         f"/process/{process_name}",
         handler,
-        methods=["POST"],
-        name=f"process_{process_name}",
+        **route_kwargs,
     )
 
 

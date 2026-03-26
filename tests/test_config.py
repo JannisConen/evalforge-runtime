@@ -27,7 +27,6 @@ def test_config_defaults() -> None:
         project={"id": "test"},
         processes={},
     )
-    assert config.secrets.provider == "env"
     assert config.auth.methods == []
     assert config.llm.model == "anthropic/claude-sonnet-4-6"
     assert config.storage.type == "local"

@@ -227,7 +227,7 @@ class TestGetGradioAuth:
     def test_no_keys_returns_none(self) -> None:
         from evalforge_runtime.ui import get_gradio_auth
 
-        with patch.dict(os.environ, {"EVALFORGE_API_KEYS": ""}, clear=False):
+        with patch.dict(os.environ, {"ENDPOINT_API_KEYS": ""}, clear=False):
             auth = get_gradio_auth(MagicMock())
             assert auth is None
 
@@ -235,7 +235,7 @@ class TestGetGradioAuth:
         from evalforge_runtime.ui import get_gradio_auth
 
         with patch.dict(
-            os.environ, {"EVALFORGE_API_KEYS": "key1,key2"}, clear=False
+            os.environ, {"ENDPOINT_API_KEYS": "key1,key2"}, clear=False
         ):
             auth = get_gradio_auth(MagicMock())
             assert auth is not None
@@ -247,7 +247,7 @@ class TestGetGradioAuth:
         from evalforge_runtime.ui import get_gradio_auth
 
         with patch.dict(
-            os.environ, {"EVALFORGE_API_KEYS": " key1 , key2 "}, clear=False
+            os.environ, {"ENDPOINT_API_KEYS": " key1 , key2 "}, clear=False
         ):
             auth = get_gradio_auth(MagicMock())
             assert auth("u", "key1") is True
@@ -316,14 +316,14 @@ class TestHTTPHelpers:
     def test_get_api_headers_no_keys(self) -> None:
         from evalforge_runtime.ui import _get_api_headers
 
-        with patch.dict(os.environ, {"EVALFORGE_API_KEYS": ""}, clear=False):
+        with patch.dict(os.environ, {"ENDPOINT_API_KEYS": ""}, clear=False):
             assert _get_api_headers() == {}
 
     def test_get_api_headers_with_keys(self) -> None:
         from evalforge_runtime.ui import _get_api_headers
 
         with patch.dict(
-            os.environ, {"EVALFORGE_API_KEYS": "key1,key2"}, clear=False
+            os.environ, {"ENDPOINT_API_KEYS": "key1,key2"}, clear=False
         ):
             headers = _get_api_headers()
             assert headers == {"X-API-Key": "key1"}

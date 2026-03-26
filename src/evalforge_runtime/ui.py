@@ -372,7 +372,7 @@ def _field_description(field_name: str, field_type: str) -> str:
 def get_gradio_auth(config: Any) -> Any | None:
     """Return a Gradio auth function compatible with the app's API key auth.
 
-    When EVALFORGE_API_KEYS is set, the Gradio login form requires:
+    When ENDPOINT_API_KEYS is set, the Gradio login form requires:
     - Username: anything (ignored)
     - Password: a valid API key
 
@@ -390,7 +390,7 @@ def get_gradio_auth(config: Any) -> Any | None:
 
 def _get_valid_api_keys() -> list[str]:
     """Get valid API keys from environment (same logic as auth.py)."""
-    raw = os.environ.get("EVALFORGE_API_KEYS", "")
+    raw = os.environ.get("ENDPOINT_API_KEYS", "")
     return [k.strip() for k in raw.split(",") if k.strip()]
 
 

@@ -18,19 +18,6 @@ class ProjectConfig(BaseModel):
     version: str = "0.0.0"
 
 
-class SecretConfig(BaseModel):
-    provider: Literal[
-        "evalforge", "env", "azure_keyvault", "aws_secrets_manager", "sap_credential_store"
-    ] = "env"
-    # Azure Key Vault
-    vault_url: str | None = None
-    # AWS Secrets Manager
-    region: str | None = None
-    secret_name: str | None = None
-    # SAP Credential Store
-    instance: str | None = None
-
-
 class AuthMethod(BaseModel):
     type: Literal["oauth2", "api_key"]
     issuer: str | None = None
@@ -108,7 +95,6 @@ class UIConfig(BaseModel):
 
 class AppConfig(BaseModel):
     project: ProjectConfig
-    secrets: SecretConfig = SecretConfig()
     auth: AuthConfig = AuthConfig()
     llm: LLMConfig = LLMConfig()
     database: DatabaseConfig = DatabaseConfig()

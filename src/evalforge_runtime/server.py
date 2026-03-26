@@ -31,7 +31,6 @@ from evalforge_runtime.files import process_uploaded_file, resolve_file_refs
 from evalforge_runtime.observability import get_execution_stats
 from evalforge_runtime.pipeline import Pipeline
 from evalforge_runtime.scheduler import Scheduler
-from evalforge_runtime.secrets import SecretManager
 from evalforge_runtime.storage import LocalStorage
 
 logger = logging.getLogger(__name__)
@@ -50,12 +49,6 @@ def create_app(config: AppConfig) -> FastAPI:
     executor = Executor(config.llm.model, observability=config.observability)
     auth_dep = APIKeyAuth(config.auth)
     scheduler = Scheduler()
-    secret_manager = SecretManager(
-        config.secrets,
-        project_id=config.project.id,
-        evalforge_url=config.project.evalforge_url or "",
-    )
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         global _start_time
@@ -64,8 +57,8 @@ def create_app(config: AppConfig) -> FastAPI:
         # Init DB
         await init_db(db_url)
 
-        # Load secrets
-        secrets = await secret_manager.load()
+        # Secrets come from environment variables
+        secrets = dict(os.environ)
 
         # Initialize connectors
         connectors = _init_connectors(config, secrets, storage)

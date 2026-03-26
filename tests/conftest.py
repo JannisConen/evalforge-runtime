@@ -13,7 +13,7 @@ from evalforge_runtime.config import AppConfig, load_config
 from evalforge_runtime.db import Base, init_db, close_db
 
 # Set API keys for tests
-os.environ["EVALFORGE_API_KEYS"] = "test-key-123,another-key"
+os.environ["ENDPOINT_API_KEYS"] = "test-key-123,another-key"
 
 
 @pytest.fixture
@@ -23,9 +23,6 @@ def config_yaml(tmp_path: Path) -> Path:
 project:
   id: "test_proj"
   version: "0.1.0"
-
-secrets:
-  provider: env
 
 auth:
   methods:

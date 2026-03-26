@@ -51,11 +51,11 @@ processes:
 ### 2. Set your API keys
 
 ```bash
-export EVALFORGE_API_KEYS=my-secret-key
+export ENDPOINT_API_KEYS=my-secret-key
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-`EVALFORGE_API_KEYS` is a comma-separated list of keys that authenticate requests to the runtime.
+`ENDPOINT_API_KEYS` is a comma-separated list of keys that authenticate requests to the runtime.
 
 ### 3. Start the server
 

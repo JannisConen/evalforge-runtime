@@ -17,7 +17,7 @@ class APIKeyAuth:
     async def __call__(self, request: Request) -> str:
         """Validate the request. Returns the authenticated key.
 
-        If EVALFORGE_API_KEYS is not set or empty, auth is skipped
+        If ENDPOINT_API_KEYS is not set or empty, auth is skipped
         (allows local development without configuring keys).
         """
         valid_keys = self._get_valid_keys()
@@ -35,11 +35,11 @@ class APIKeyAuth:
     def _get_valid_keys(self) -> list[str]:
         """Get list of valid API keys from environment.
 
-        Includes EVALFORGE_API_KEYS (comma-separated) and EVALFORGE_SERVICE_KEY
+        Includes ENDPOINT_API_KEYS (comma-separated) and EVALFORGE_SERVICE_KEY
         (project-scoped key for process-to-process calls).
         """
         keys: list[str] = []
-        raw = os.environ.get("EVALFORGE_API_KEYS", "")
+        raw = os.environ.get("ENDPOINT_API_KEYS", "")
         keys.extend(k.strip() for k in raw.split(",") if k.strip())
         service_key = os.environ.get("EVALFORGE_SERVICE_KEY", "").strip()
         if service_key and service_key not in keys:

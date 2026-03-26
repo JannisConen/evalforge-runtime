@@ -37,7 +37,6 @@ class Executor:
             os.environ.setdefault("LANGFUSE_HOST", langfuse_cfg.host)
 
         # LiteLLM reads LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY from env
-        # (injected by SecretManager before Executor is created)
         litellm.success_callback = list(set(litellm.success_callback + ["langfuse"]))
         litellm.failure_callback = list(set(litellm.failure_callback + ["langfuse"]))
         logger.info("Langfuse observability enabled via LiteLLM callbacks")

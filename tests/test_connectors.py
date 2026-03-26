@@ -91,7 +91,7 @@ async def test_env_secret_provider():
     secrets = await provider.fetch()
     # Should contain env vars
     assert isinstance(secrets, dict)
-    assert "EVALFORGE_API_KEYS" in secrets  # set in conftest
+    assert "ENDPOINT_API_KEYS" in secrets  # set in conftest
 
 
 @pytest.mark.asyncio

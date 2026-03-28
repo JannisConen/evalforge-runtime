@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from evalforge_runtime.config import AppConfig, ProcessConfig
 from evalforge_runtime.db import (
+    create_decision,
     create_execution,
     get_execution,
     get_session_factory,
@@ -18,12 +19,13 @@ from evalforge_runtime.db import (
     update_execution,
 )
 from evalforge_runtime.executor import Executor
-from evalforge_runtime.storage import LocalStorage
+from evalforge_runtime.storage import StorageBackend
 from evalforge_runtime.types import (
     After,
     Before,
     Execution,
     ExecutionContext,
+    HumanReviewRequested,
     LLMClient,
     TriggerContext,
 )
@@ -38,7 +40,7 @@ class Pipeline:
         self,
         config: AppConfig,
         executor: Executor,
-        storage: LocalStorage,
+        storage: StorageBackend,
         secrets: dict[str, str],
     ):
         self.config = config
@@ -67,6 +69,7 @@ class Pipeline:
         input_data: dict[str, Any],
         trigger: TriggerContext,
         execution_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Execute a single process through the full pipeline.
 
@@ -77,6 +80,7 @@ class Pipeline:
             raise ValueError(f"Unknown process: {process_name}")
 
         execution_id = execution_id or str(uuid4())
+        request_id = request_id or str(uuid4())
         modules = self._modules.get(process_name, {})
         from evalforge_runtime import __version__
 
@@ -94,6 +98,7 @@ class Pipeline:
                 input_data=input_data,
                 runtime_version=__version__,
                 config_version=self.config.project.version,
+                request_id=request_id,
             )
             if trigger.source_execution_id:
                 await update_execution(
@@ -103,15 +108,16 @@ class Pipeline:
                 )
 
         logger.info(
-            "Starting pipeline for '%s' (execution=%s), input_data=%s",
-            process_name, execution_id, input_data,
+            "Starting pipeline for '%s' (execution=%s, request=%s), input_data=%s",
+            process_name, execution_id, request_id, input_data,
         )
         start = time.monotonic()
 
         try:
             # --- EXECUTION step ---
             output, llm_tracking = await self._run_execution(
-                process_name, proc_config, modules, input_data, trigger, execution_id
+                process_name, proc_config, modules, input_data, trigger, execution_id,
+                request_id=request_id,
             )
             duration_ms = int((time.monotonic() - start) * 1000)
             logger.info(
@@ -134,6 +140,12 @@ class Pipeline:
                         status="pending_review",
                         duration_ms=duration_ms,
                     )
+                # Fire review webhook if configured
+                if proc_config.review.webhook_url:
+                    await self._fire_review_webhook(
+                        proc_config, execution_id, process_name,
+                        input_data, output, trigger, request_id,
+                    )
                 logger.info(
                     f"Execution {execution_id} for '{process_name}' pending review"
                 )
@@ -154,6 +166,7 @@ class Pipeline:
                     after_mod.config["context"] = {
                         "initiator": proc_config.connector_params or {},
                         "process": {"name": process_name, "id": proc_config.process_id},
+                        "request_id": request_id,
                     }
                     await after_mod.execute(trigger, output)
                     logger.info("After step completed for '%s'", process_name)
@@ -174,10 +187,39 @@ class Pipeline:
 
             # Trigger downstream processes
             await self._trigger_downstream(
-                process_name, input_data, output, execution_id
+                process_name, input_data, output, execution_id,
+                request_id=request_id,
             )
 
             return output
+
+        except HumanReviewRequested as review_req:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            async with session_factory() as session:
+                await update_execution(
+                    session,
+                    execution_id,
+                    output=review_req.output,
+                    status="pending_review",
+                    duration_ms=duration_ms,
+                )
+                await create_decision(
+                    session,
+                    execution_id=execution_id,
+                    decision="pending",
+                    source="programmatic",
+                    reason=review_req.reason,
+                    original_output=review_req.output,
+                    request_id=request_id,
+                    metadata=review_req.metadata,
+                )
+            if proc_config.review.webhook_url:
+                await self._fire_review_webhook(
+                    proc_config, execution_id, process_name,
+                    input_data, review_req.output, trigger, request_id,
+                )
+            logger.info(f"Programmatic review requested for execution {execution_id}")
+            return review_req.output
 
         except Exception as exc:
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -201,6 +243,7 @@ class Pipeline:
         input_data: dict[str, Any],
         trigger: TriggerContext,
         execution_id: str,
+        request_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Run the execution step (custom or default LLM).
 
@@ -237,6 +280,8 @@ class Pipeline:
                 process_name=process_name,
                 process_id=proc_config.process_id,
                 trigger=trigger,
+                execution_id=execution_id,
+                request_id=request_id,
             )
             output = await execution_mod.run(input_data, context)
             logger.info("Custom execution output for '%s': %s", process_name, output)
@@ -291,6 +336,7 @@ class Pipeline:
         source_input: dict[str, Any],
         source_output: dict[str, Any],
         source_execution_id: str,
+        request_id: str | None = None,
     ) -> None:
         """Trigger downstream processes that chain from this one."""
         downstream = self._downstream_map.get(source_process, [])
@@ -337,9 +383,12 @@ class Pipeline:
                     type="process_chain",
                     ref=source_process,
                     source_execution_id=source_execution_id,
+                    request_id=request_id,
                 )
 
-                await self.execute_process(ds_name, ds_input, trigger)
+                await self.execute_process(
+                    ds_name, ds_input, trigger, request_id=request_id,
+                )
 
             except Exception as e:
                 logger.error(
@@ -372,6 +421,7 @@ class Pipeline:
             trigger_ref = execution.trigger_ref
             source_execution_id = execution.source_execution_id
             input_data = _json.loads(execution.input_data)
+            request_id = execution.request_id
 
             await update_execution(
                 session,
@@ -384,14 +434,29 @@ class Pipeline:
                 review_modified=modified_output is not None,
             )
 
+            # Log the decision
+            await create_decision(
+                session,
+                execution_id=execution_id,
+                decision="edited" if modified_output else "approved",
+                decided_by=reviewed_by,
+                original_output=_json.loads(execution.output_data) if modified_output else None,
+                modified_output=modified_output,
+                request_id=request_id,
+                source="config",
+            )
+
         # Run after step
+        process_name = process_name  # already captured above
+        proc_config = self.config.processes.get(process_name)
         modules = self._modules.get(process_name, {})
         after_mod: After | None = modules.get("after")
-        if after_mod:
+        if after_mod and proc_config:
             trigger = TriggerContext(
                 type="review_approved",
                 ref=trigger_ref,
                 source_execution_id=source_execution_id,
+                request_id=request_id,
             )
             try:
                 after_mod.config["secrets"] = self.secrets
@@ -400,6 +465,7 @@ class Pipeline:
                 after_mod.config["context"] = {
                     "initiator": proc_config.connector_params or {},
                     "process": {"name": process_name, "id": proc_config.process_id},
+                    "request_id": request_id,
                 }
                 await after_mod.execute(trigger, output)
             except Exception as e:
@@ -407,7 +473,8 @@ class Pipeline:
 
         # Trigger downstream
         await self._trigger_downstream(
-            process_name, input_data, output, execution_id
+            process_name, input_data, output, execution_id,
+            request_id=request_id,
         )
 
         return output
@@ -439,6 +506,17 @@ class Pipeline:
                 finished_at=datetime.utcnow(),
                 reviewed_by=reviewed_by,
                 reviewed_at=datetime.utcnow(),
+            )
+
+            # Log the decision
+            await create_decision(
+                session,
+                execution_id=execution_id,
+                decision="rejected",
+                decided_by=reviewed_by,
+                reason=reason,
+                request_id=execution.request_id,
+                source="config",
             )
 
     async def expire_reviews(self) -> int:
@@ -474,6 +552,45 @@ class Pipeline:
                     )
 
         return expired_count
+
+    async def _fire_review_webhook(
+        self,
+        proc_config: ProcessConfig,
+        execution_id: str,
+        process_name: str,
+        input_data: dict[str, Any],
+        output: dict[str, Any],
+        trigger: TriggerContext,
+        request_id: str | None = None,
+    ) -> None:
+        """Fire webhook to notify external service about pending review."""
+        import httpx
+
+        payload = {
+            "event": "review_requested",
+            "execution_id": execution_id,
+            "request_id": request_id,
+            "process_name": process_name,
+            "input": input_data,
+            "output": output,
+            "trigger_type": trigger.type,
+            "trigger_ref": trigger.ref,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            **proc_config.review.webhook_headers,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    proc_config.review.webhook_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=10,
+                )
+            logger.info(f"Review webhook sent for execution {execution_id}")
+        except Exception as e:
+            logger.error(f"Review webhook failed for execution {execution_id}: {e}")
 
 
 def _load_process_modules(

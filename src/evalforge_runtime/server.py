@@ -31,7 +31,7 @@ from evalforge_runtime.files import process_uploaded_file, resolve_file_refs
 from evalforge_runtime.observability import get_execution_stats
 from evalforge_runtime.pipeline import Pipeline
 from evalforge_runtime.scheduler import Scheduler
-from evalforge_runtime.storage import LocalStorage
+from evalforge_runtime.storage import StorageBackend, create_storage
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +41,25 @@ _start_time: float = 0.0
 def create_app(config: AppConfig) -> FastAPI:
     """Create and configure the FastAPI application."""
 
-    # Resolve database URL
-    db_url = config.database.url
+    # Resolve database URL based on logging backend
+    if config.logging_config.backend == "postgres":
+        db_url = os.environ.get("LOGGING_DATABASE_URL", config.database.url)
+    else:
+        db_url = config.database.url
 
     # Initialize subsystems
-    storage = LocalStorage(config.storage.path)
+    storage = create_storage(config.storage)
+
+    # Initialize webhook logging backend if configured
+    webhook_backend = None
+    if config.logging_config.backend == "webhook" and config.logging_config.webhook_url:
+        from evalforge_runtime.db import WebhookLoggingBackend
+
+        webhook_secret = os.environ.get("WEBHOOK_SECRET") if config.logging_config.webhook_auth else None
+        webhook_backend = WebhookLoggingBackend(
+            url=config.logging_config.webhook_url,
+            secret=webhook_secret,
+        )
     executor = Executor(config.llm.model, observability=config.observability)
     auth_dep = APIKeyAuth(config.auth)
     scheduler = Scheduler()
@@ -172,6 +186,7 @@ def create_app(config: AppConfig) -> FastAPI:
             app, process_name, process_config, executor, storage, auth_dep, config,
             lambda: app.state.pipeline,
             lambda: getattr(app.state, "execution_semaphore", None),
+            webhook_backend=webhook_backend,
         )
 
     # --- Execution endpoints (authenticated) ---
@@ -334,6 +349,54 @@ def create_app(config: AppConfig) -> FastAPI:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.post("/reviews/{execution_id}/edit")
+    async def edit_review_endpoint(
+        execution_id: str,
+        request: Request,
+        _auth: str = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        pl = app.state.pipeline
+        if not pl:
+            raise HTTPException(status_code=503, detail="Pipeline not initialized")
+
+        body = await request.json()
+        modified_output = body.get("output")
+        reviewed_by = body.get("reviewed_by")
+
+        if not modified_output:
+            raise HTTPException(status_code=400, detail="output is required for edit")
+
+        try:
+            output = await pl.approve_review(execution_id, modified_output, reviewed_by)
+            return {"status": "edited", "output": output}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/decisions")
+    async def list_decisions_endpoint(
+        execution_id: str | None = None,
+        request_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        _auth: str = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        from evalforge_runtime.db import list_decisions
+
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            decisions = await list_decisions(
+                session,
+                execution_id=execution_id,
+                request_id=request_id,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "decisions": [d.to_dict() for d in decisions],
+                "limit": limit,
+                "offset": offset,
+            }
+
     return app
 
 
@@ -341,12 +404,13 @@ def _make_process_handler(
     process_name: str,
     process_config: ProcessConfig,
     executor: Executor,
-    storage: LocalStorage,
+    storage: StorageBackend,
     auth_dep: APIKeyAuth,
     config: AppConfig,
     get_pipeline,
     get_semaphore=None,
     input_model: type | None = None,
+    webhook_backend=None,
 ):
     """Create a process endpoint handler with properly captured closure variables.
 
@@ -400,6 +464,11 @@ def _make_process_handler(
         if not isinstance(input_data, dict):
             raise HTTPException(status_code=400, detail="Input must be a JSON object")
 
+        # Extract request_id from header or body
+        request_id = request.headers.get("x-request-id")
+        if isinstance(input_data, dict):
+            request_id = input_data.pop("_request_id", None) or request_id
+
         # Resolve FileRefs: download from URL or decode base64 data
         input_data = await resolve_file_refs(input_data, execution_id, storage)
 
@@ -414,14 +483,39 @@ def _make_process_handler(
                 if semaphore:
                     async with semaphore:
                         output = await pl.execute_process(
-                            process_name, input_data, trigger, execution_id
+                            process_name, input_data, trigger, execution_id,
+                            request_id=request_id,
                         )
                 else:
                     output = await pl.execute_process(
-                        process_name, input_data, trigger, execution_id
+                        process_name, input_data, trigger, execution_id,
+                        request_id=request_id,
                     )
+
+                # Fire webhook if configured
+                if webhook_backend:
+                    try:
+                        await webhook_backend.log_execution({
+                            "execution_id": execution_id,
+                            "process_name": process_name,
+                            "status": "success",
+                            "output": output,
+                        })
+                    except Exception as wh_err:
+                        logger.warning("Webhook logging failed: %s", wh_err)
+
+                # Cleanup temporary storage
+                from evalforge_runtime.storage import NoneStorage
+
+                if isinstance(storage, NoneStorage):
+                    storage.cleanup(execution_id)
+
                 return output or {}
             except Exception as exc:
+                from evalforge_runtime.storage import NoneStorage
+
+                if isinstance(storage, NoneStorage):
+                    storage.cleanup(execution_id)
                 raise HTTPException(status_code=500, detail=str(exc))
 
         # Fallback: direct LLM execution (Phase 1 mode)
@@ -480,6 +574,25 @@ def _make_process_handler(
                     instructions_version=result.instructions_version,
                 )
 
+            # Fire webhook if configured
+            if webhook_backend:
+                try:
+                    await webhook_backend.log_execution({
+                        "execution_id": execution_id,
+                        "process_name": process_name,
+                        "status": "success",
+                        "duration_ms": duration_ms,
+                        "output": result.output,
+                    })
+                except Exception as wh_err:
+                    logger.warning("Webhook logging failed: %s", wh_err)
+
+            # Cleanup temporary storage
+            from evalforge_runtime.storage import NoneStorage
+
+            if isinstance(storage, NoneStorage):
+                storage.cleanup(execution_id)
+
             return result.output
 
         except Exception as exc:
@@ -493,6 +606,13 @@ def _make_process_handler(
                     finished_at=datetime.utcnow(),
                     duration_ms=duration_ms,
                 )
+
+            # Cleanup temporary storage on error too
+            from evalforge_runtime.storage import NoneStorage
+
+            if isinstance(storage, NoneStorage):
+                storage.cleanup(execution_id)
+
             raise HTTPException(status_code=500, detail=str(exc))
 
     return process_endpoint
@@ -516,11 +636,12 @@ def _register_process_route(
     process_name: str,
     process_config: ProcessConfig,
     executor: Executor,
-    storage: LocalStorage,
+    storage: StorageBackend,
     auth_dep: APIKeyAuth,
     config: AppConfig,
     get_pipeline=None,
     get_semaphore=None,
+    webhook_backend=None,
 ) -> None:
     """Register a POST /process/{name} endpoint for a process.
 
@@ -540,6 +661,7 @@ def _register_process_route(
         get_pipeline or (lambda: None),
         get_semaphore,
         input_model=input_model,
+        webhook_backend=webhook_backend,
     )
     route_kwargs: dict[str, Any] = {
         "methods": ["POST"],
@@ -558,7 +680,7 @@ def _register_process_route(
 async def _parse_multipart(
     request: Request,
     execution_id: str,
-    storage: LocalStorage,
+    storage: StorageBackend,
 ) -> dict[str, Any]:
     """Parse a multipart/form-data request into an input dict with FileRefs."""
     form = await request.form()
@@ -594,7 +716,7 @@ async def _parse_multipart(
 
 
 def _init_connectors(
-    config: AppConfig, secrets: dict[str, str], storage: LocalStorage
+    config: AppConfig, secrets: dict[str, str], storage: StorageBackend
 ) -> dict[str, Any]:
     """Initialize connectors for processes that use them."""
     from evalforge_runtime.connectors.exchange import ExchangeConnector
@@ -625,7 +747,7 @@ def _register_scheduled_jobs(
     pipeline: Pipeline,
     connectors: dict[str, Any],
     semaphore: asyncio.Semaphore,
-    storage: LocalStorage | None = None,
+    storage: StorageBackend | None = None,
 ) -> None:
     """Register cron-triggered jobs for scheduled processes."""
     for pname, pconfig in config.processes.items():

@@ -62,6 +62,12 @@ class ProcessCallAction(BaseAction):
         if api_key:
             headers["X-API-Key"] = api_key
 
+        # Propagate request_id for HITL tracing across process chains
+        context = kwargs.get("context") or {}
+        request_id = context.get("request_id")
+        if request_id:
+            headers["X-Request-ID"] = request_id
+
         logger.info(f"Calling process '{target_name}' at {url}")
 
         async with httpx.AsyncClient(timeout=120) as client:

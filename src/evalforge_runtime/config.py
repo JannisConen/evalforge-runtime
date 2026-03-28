@@ -36,6 +36,8 @@ class LLMConfig(BaseModel):
 class ReviewConfig(BaseModel):
     enabled: bool = False
     timeout: str = "24h"
+    webhook_url: str | None = None
+    webhook_headers: dict[str, str] = {}
 
 
 class LangfuseConfig(BaseModel):
@@ -82,10 +84,16 @@ class DatabaseConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    type: Literal["local", "s3"] = "local"
+    type: Literal["none", "local", "s3", "gcp", "azure"] = "local"
     path: str = "./data/files"
     bucket: str | None = None
     region: str | None = None
+
+
+class LoggingConfig(BaseModel):
+    backend: Literal["sqlite", "postgres", "webhook"] = "sqlite"
+    webhook_url: str | None = None
+    webhook_auth: bool = True
 
 
 class UIConfig(BaseModel):
@@ -100,6 +108,7 @@ class AppConfig(BaseModel):
     database: DatabaseConfig = DatabaseConfig()
     storage: StorageConfig = StorageConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
+    logging_config: LoggingConfig = LoggingConfig()
     ui: UIConfig = UIConfig()
     processes: dict[str, ProcessConfig] = {}
     max_concurrent_executions: int = int(os.environ.get("MAX_CONCURRENT_EXECUTIONS", "10"))

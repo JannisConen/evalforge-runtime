@@ -59,11 +59,14 @@ class ExecutionRecord(Base):
     reviewed_by = Column(String, nullable=True)
     reviewed_at = Column(DateTime, nullable=True)
     review_modified = Column(Boolean, nullable=True)
+    # HITL: groups related executions across process chains
+    request_id = Column(String, nullable=True)
 
     __table_args__ = (
         Index("idx_executions_process", "process_name", started_at.desc()),
         Index("idx_executions_trigger_ref", "process_name", "trigger_ref"),
         Index("idx_executions_status", "status"),
+        Index("idx_executions_request_id", "request_id"),
     )
 
     def to_dict(self) -> dict[str, Any]:
@@ -90,6 +93,7 @@ class ExecutionRecord(Base):
             "instructions_version": self.instructions_version,
             "runtime_version": self.runtime_version,
             "config_version": self.config_version,
+            "request_id": self.request_id,
         }
 
 
@@ -108,6 +112,40 @@ class ActionLog(Base):
     duration_ms = Column(Integer, nullable=True)
     error = Column(Text, nullable=True)
     action_metadata = Column("metadata", Text, nullable=True)  # JSON
+
+
+class DecisionRecord(Base):
+    """Log of human review decisions for HITL workflows."""
+
+    __tablename__ = "decisions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    execution_id = Column(String, nullable=False, index=True)
+    request_id = Column(String, nullable=True, index=True)
+    decision = Column(String, nullable=False)  # "approved", "rejected", "edited", "pending"
+    decided_by = Column(String, nullable=True)
+    decided_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    reason = Column(Text, nullable=True)
+    original_output = Column(Text, nullable=True)  # JSON
+    modified_output = Column(Text, nullable=True)  # JSON (only for "edited")
+    source = Column(String, nullable=False, default="config")  # "config" or "programmatic"
+    decision_metadata = Column("metadata", Text, nullable=True)  # JSON
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to API response dict."""
+        return {
+            "id": self.id,
+            "execution_id": self.execution_id,
+            "request_id": self.request_id,
+            "decision": self.decision,
+            "decided_by": self.decided_by,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+            "reason": self.reason,
+            "original_output": _json.loads(self.original_output) if self.original_output else None,
+            "modified_output": _json.loads(self.modified_output) if self.modified_output else None,
+            "source": self.source,
+            "metadata": _json.loads(self.decision_metadata) if self.decision_metadata else None,
+        }
 
 
 # Global engine and session factory
@@ -152,6 +190,7 @@ async def create_execution(
     trigger_ref: str | None = None,
     runtime_version: str | None = None,
     config_version: str | None = None,
+    request_id: str | None = None,
 ) -> ExecutionRecord:
     """Create a new execution record."""
     record = ExecutionRecord(
@@ -165,6 +204,7 @@ async def create_execution(
         status="running",
         runtime_version=runtime_version,
         config_version=config_version,
+        request_id=request_id,
     )
     session.add(record)
     await session.commit()
@@ -257,3 +297,87 @@ async def get_last_execution_time(
     )
     row = result.scalar_one_or_none()
     return row
+
+
+async def create_decision(
+    session: AsyncSession,
+    *,
+    execution_id: str,
+    decision: str,
+    source: str = "config",
+    decided_by: str | None = None,
+    reason: str | None = None,
+    original_output: dict[str, Any] | None = None,
+    modified_output: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> DecisionRecord:
+    """Create a new decision record."""
+    record = DecisionRecord(
+        execution_id=execution_id,
+        request_id=request_id,
+        decision=decision,
+        decided_by=decided_by,
+        decided_at=datetime.utcnow(),
+        reason=reason,
+        original_output=_json.dumps(original_output) if original_output is not None else None,
+        modified_output=_json.dumps(modified_output) if modified_output is not None else None,
+        source=source,
+        decision_metadata=_json.dumps(metadata) if metadata is not None else None,
+    )
+    session.add(record)
+    await session.commit()
+    return record
+
+
+async def list_decisions(
+    session: AsyncSession,
+    *,
+    execution_id: str | None = None,
+    request_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[DecisionRecord]:
+    """List decisions with optional filters."""
+    query = select(DecisionRecord).order_by(DecisionRecord.decided_at.desc())
+
+    if execution_id:
+        query = query.where(DecisionRecord.execution_id == execution_id)
+    if request_id:
+        query = query.where(DecisionRecord.request_id == request_id)
+
+    query = query.limit(limit).offset(offset)
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+class WebhookLoggingBackend:
+    """Posts execution events to an external webhook URL."""
+
+    def __init__(self, url: str, secret: str | None = None):
+        self.url = url
+        self.secret = secret
+
+    async def log_execution(self, record_dict: dict) -> None:
+        """POST execution data to webhook."""
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if self.secret:
+            import hashlib
+            import hmac
+
+            body = _json.dumps(record_dict)
+            sig = hmac.new(self.secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+            headers["X-Webhook-Signature"] = sig
+        else:
+            body = None  # httpx will handle json
+
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                self.url,
+                json=record_dict if not body else None,
+                content=body,
+                headers=headers,
+                timeout=10,
+            )

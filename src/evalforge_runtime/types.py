@@ -68,12 +68,28 @@ class ExecutionResult(BaseModel):
     instructions_version: str | None = None
 
 
+class HumanReviewRequested(Exception):
+    """Raised from execution code to request human review."""
+
+    def __init__(
+        self,
+        output: dict[str, Any],
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        self.output = output
+        self.reason = reason
+        self.metadata = metadata
+        super().__init__(f"Human review requested: {reason or 'no reason given'}")
+
+
 class TriggerContext(BaseModel):
     """Context about what triggered an execution."""
 
     type: str  # "webhook", "manual", "schedule", "process_chain"
     ref: str | None = None
     source_execution_id: str | None = None
+    request_id: str | None = None  # Groups related executions across chains
 
 
 # --- Three-step process model base classes ---
@@ -115,6 +131,8 @@ class ExecutionContext:
         process_name: str,
         process_id: str,
         trigger: TriggerContext,
+        execution_id: str | None = None,
+        request_id: str | None = None,
     ):
         self.llm = llm
         self.prompts = prompts
@@ -124,11 +142,22 @@ class ExecutionContext:
         self.process_name = process_name
         self.process_id = process_id
         self.trigger = trigger
+        self.execution_id = execution_id
+        self.request_id = request_id
 
     @property
     def instructions(self) -> str | None:
         """Backward compat: returns prompts['system'] if it exists."""
         return self.prompts.get("system")
+
+    async def request_review(
+        self,
+        output: dict[str, Any],
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Request human review. Raises HumanReviewRequested which the pipeline catches."""
+        raise HumanReviewRequested(output=output, reason=reason, metadata=metadata)
 
 
 class Execution(ABC):

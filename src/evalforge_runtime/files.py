@@ -14,6 +14,33 @@ from evalforge_runtime.types import FileRef
 
 logger = logging.getLogger(__name__)
 
+# Extensions whose content is automatically read as text during FileRef resolution.
+# For these files, the resolved dict will include a "content" field with the text.
+# Binary files (PDF, images, etc.) only get a "path" — read them in execution.py.
+TEXT_EXTENSIONS: set[str] = {
+    # Plain text
+    "txt", "text", "log", "ini", "cfg", "conf",
+    # Email
+    "eml",
+    # Data / markup
+    "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml", "toml",
+    # Web / docs
+    "html", "htm", "xhtml", "md", "markdown", "rst", "tex",
+    # Code (common)
+    "py", "js", "ts", "java", "c", "cpp", "h", "cs", "rb", "go", "rs", "sh", "bat", "ps1", "sql",
+}
+
+
+def _is_text_file(filename: str, mime_type: str) -> bool:
+    """Determine if a file should be auto-read as text."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext in TEXT_EXTENSIONS:
+        return True
+    # Also check MIME type for anything text/*
+    if mime_type.startswith("text/") or mime_type in ("application/json", "application/xml", "message/rfc822"):
+        return True
+    return False
+
 
 async def process_uploaded_file(
     file: UploadFile,
@@ -65,8 +92,10 @@ async def resolve_file_refs(
     - Otherwise: leave as-is (already a local ref)
 
     The FileRef is replaced with a simplified dict containing ``filename``,
-    ``path`` (local storage path), ``mimeType``, and ``size`` so downstream
-    code (LLM prompt, pipeline) gets useful info without internal keys.
+    ``path`` (local storage path), ``mimeType``, ``extension``, and ``size``.
+    For text files (.eml, .txt, .csv, .json, .xml, etc.), a ``content`` field
+    is added with the decoded text so execution.py can use it directly.
+    Binary files only get ``path`` — use a library to read them.
     """
     if isinstance(obj, list):
         return [await resolve_file_refs(item, execution_id, storage) for item in obj]
@@ -133,10 +162,19 @@ async def _resolve_single(
     await storage.put(local_key, content, mime_type)
     local_path = str(storage.base_path / local_key)
 
-    return {
+    result: dict[str, Any] = {
         "filename": filename,
         "path": local_path,
         "mimeType": mime_type,
         "extension": extension,
         "size": len(content),
     }
+
+    # Auto-read text content so execution.py doesn't have to
+    if _is_text_file(filename, mime_type):
+        try:
+            result["content"] = content.decode("utf-8", errors="replace")
+        except Exception:
+            logger.debug("Could not decode %s as text, skipping content field", filename)
+
+    return result

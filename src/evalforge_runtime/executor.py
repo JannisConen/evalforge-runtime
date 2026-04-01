@@ -97,10 +97,27 @@ class Executor:
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
         logger.info("LLM raw response for '%s' (%dms): %s", process_name, latency_ms, content)
 
-        output = json.loads(content)
+        if content is not None:
+            output = json.loads(content)
+        elif hasattr(message, "parsed") and message.parsed is not None:
+            # Structured outputs API (OpenAI-style): parsed Pydantic object in message.parsed
+            parsed = message.parsed
+            output = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
+        elif getattr(message, "tool_calls", None):
+            # litellm converts Pydantic response_format to tool calls for some providers (e.g. Claude).
+            # The JSON result is in tool_calls[0].function.arguments.
+            output = json.loads(message.tool_calls[0].function.arguments)
+        else:
+            finish_reason = response.choices[0].finish_reason
+            raise ValueError(
+                f"LLM returned no content for '{process_name}'. "
+                f"finish_reason={finish_reason!r}. "
+                "Check that the model supports the requested response_format."
+            )
         usage = response.usage
 
         logger.info(

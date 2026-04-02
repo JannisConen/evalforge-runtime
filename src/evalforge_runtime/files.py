@@ -31,6 +31,49 @@ TEXT_EXTENSIONS: set[str] = {
 }
 
 
+def _decode_eml(content: bytes) -> str:
+    """Parse an .eml file and return a human-readable text representation.
+
+    Decodes MIME parts (base64, quoted-printable, etc.) so execution code
+    receives plain text rather than the raw MIME envelope.
+    """
+    import email as _email
+
+    msg = _email.message_from_bytes(content)
+    subject = msg.get("Subject", "")
+    sender = msg.get("From", "")
+    recipient = msg.get("To", "")
+    date = msg.get("Date", "")
+
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+        else:
+            body = msg.get_payload() or ""
+
+    lines = []
+    if sender:
+        lines.append(f"From: {sender}")
+    if recipient:
+        lines.append(f"To: {recipient}")
+    if date:
+        lines.append(f"Date: {date}")
+    if subject:
+        lines.append(f"Subject: {subject}")
+    lines.append("")
+    lines.append(body)
+    return "\n".join(lines)
+
+
 def _is_text_file(filename: str, mime_type: str) -> bool:
     """Determine if a file should be auto-read as text."""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -173,7 +216,11 @@ async def _resolve_single(
     # Auto-read text content so execution.py doesn't have to
     if _is_text_file(filename, mime_type):
         try:
-            result["content"] = content.decode("utf-8", errors="replace")
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if ext == "eml" or mime_type == "message/rfc822":
+                result["content"] = _decode_eml(content)
+            else:
+                result["content"] = content.decode("utf-8", errors="replace")
         except Exception:
             logger.debug("Could not decode %s as text, skipping content field", filename)
 

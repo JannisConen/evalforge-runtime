@@ -269,7 +269,7 @@ class LLMClient:
             _format = response_format
             system_content = instructions + "\n\nRespond with valid JSON only."
         else:
-            # Pydantic model class — structured output
+            # Pydantic model class — pass directly to litellm for structured output
             _format = response_format
             system_content = instructions
 
@@ -284,7 +284,8 @@ class LLMClient:
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
 
         # Track usage
         self.last_model = response.model or _model
@@ -300,4 +301,23 @@ class LLMClient:
         except Exception:
             pass
 
-        return json.loads(content)
+        # 1. Try .parsed (litellm structured output via Pydantic model)
+        parsed = getattr(message, "parsed", None)
+        if parsed is not None:
+            return parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
+
+        # 2. Try tool_calls (litellm maps Anthropic tool-use structured output here)
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            return json.loads(tool_calls[0].function.arguments)
+
+        # 3. Plain content — strip markdown fences if present
+        if content:
+            stripped = content.strip()
+            if stripped.startswith("```"):
+                stripped = stripped.split("\n", 1)[-1]
+                stripped = stripped.rsplit("```", 1)[0]
+                content = stripped.strip()
+            return json.loads(content)
+
+        raise ValueError("LLM returned no content")

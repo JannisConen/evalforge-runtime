@@ -83,27 +83,38 @@ class Executor:
             "LLM system prompt (first 500 chars): %.500s", instructions,
         )
 
-        # Build response_format and system prompt
-        if output_schema is not None:
-            if isinstance(output_schema, type):
-                # Pydantic model class — pass directly to LiteLLM
-                response_format: Any = output_schema
-            else:
-                # Legacy dict format — convert to Pydantic model
-                response_format = schema_to_model(
-                    f"{process_name.replace('-', '_').title().replace('_', '')}Output",
-                    output_schema,
-                )
-            system_content = instructions
-        else:
-            response_format = {"type": "json_object"}
-            system_content = instructions + "\n\nRespond with valid JSON only."
-
         # Resolve max output tokens for this model.
         # litellm.get_max_tokens() returns the context window (e.g. 200k for Claude),
         # NOT the max output tokens. We need get_model_info()['max_output_tokens'] instead.
         max_tokens = _get_max_output_tokens(model)
-        logger.info("LLM max_tokens for model '%s': %d", model, max_tokens)
+
+        # Build completion kwargs. For Pydantic output schemas we use explicit tool_use
+        # instead of response_format=PydanticClass. See LLMClient.complete() for the
+        # full explanation — same issue applies here.
+        completion_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "num_retries": 3,
+            "metadata": {"process_name": process_name, "instructions_version": instructions_hash},
+        }
+
+        if output_schema is not None:
+            if not isinstance(output_schema, type):
+                # Legacy dict format — convert to Pydantic model first
+                output_schema = schema_to_model(
+                    f"{process_name.replace('-', '_').title().replace('_', '')}Output",
+                    output_schema,
+                )
+            schema = output_schema.model_json_schema()
+            completion_kwargs["tools"] = [
+                {"type": "function", "function": {"name": "structured_output", "parameters": schema}}
+            ]
+            completion_kwargs["tool_choice"] = {"type": "function", "function": {"name": "structured_output"}}
+            system_content = instructions
+        else:
+            completion_kwargs["response_format"] = {"type": "json_object"}
+            system_content = instructions + "\n\nRespond with valid JSON only."
+
+        logger.info("LLM max_tokens for model '%s': %d, mode=%s", model, max_tokens, "tool_use" if "tools" in completion_kwargs else "json_object")
 
         start = time.monotonic()
         response = await litellm.acompletion(
@@ -112,32 +123,43 @@ class Executor:
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": json.dumps(input_data)},
             ],
-            response_format=response_format,
-            max_tokens=max_tokens,
-            num_retries=3,
-            metadata={
-                "process_name": process_name,
-                "instructions_version": instructions_hash,
-            },
+            **completion_kwargs,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
         message = response.choices[0].message
         content = message.content
-        logger.info("LLM raw response for '%s' (%dms): %s", process_name, latency_ms, content)
+        finish_reason = response.choices[0].finish_reason
+        logger.info(
+            "LLM response for '%s' (%dms): finish_reason=%s tokens_out=%s has_content=%s has_parsed=%s has_tool_calls=%s",
+            process_name, latency_ms, finish_reason,
+            response.usage.completion_tokens if response.usage else "?",
+            content is not None,
+            getattr(message, "parsed", None) is not None,
+            bool(getattr(message, "tool_calls", None)),
+        )
 
-        if content is not None:
-            output = json.loads(content)
-        elif hasattr(message, "parsed") and message.parsed is not None:
+        if hasattr(message, "parsed") and message.parsed is not None:
             # Structured outputs API (OpenAI-style): parsed Pydantic object in message.parsed
             parsed = message.parsed
             output = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
         elif getattr(message, "tool_calls", None):
             # litellm converts Pydantic response_format to tool calls for some providers (e.g. Claude).
-            # The JSON result is in tool_calls[0].function.arguments.
-            output = json.loads(message.tool_calls[0].function.arguments)
+            raw = message.tool_calls[0].function.arguments
+            logger.info("LLM tool_call arguments for '%s': %r", process_name, raw[:500] if raw else None)
+            try:
+                output = json.loads(raw)
+            except json.JSONDecodeError as e:
+                logger.error("LLM tool_call JSON parse failed for '%s': %s\nFull arguments: %r", process_name, e, raw)
+                raise ValueError(f"LLM returned malformed JSON in tool_call arguments for '{process_name}': {e}") from e
+        elif content is not None:
+            logger.info("LLM content for '%s': %r", process_name, content[:500])
+            try:
+                output = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error("LLM content JSON parse failed for '%s': %s\nFull content: %r", process_name, e, content)
+                raise ValueError(f"LLM returned malformed JSON in content for '{process_name}': {e}") from e
         else:
-            finish_reason = response.choices[0].finish_reason
             raise ValueError(
                 f"LLM returned no content for '{process_name}'. "
                 f"finish_reason={finish_reason!r}. "

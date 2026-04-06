@@ -282,23 +282,41 @@ class LLMClient:
 
         _model = model or self._default_model
 
-        if response_format is None:
-            _format: Any = {"type": "json_object"}
-            system_content = instructions + "\n\nRespond with valid JSON only."
-        elif isinstance(response_format, dict):
-            _format = response_format
-            system_content = instructions + "\n\nRespond with valid JSON only."
-        else:
-            # Pydantic model class — pass directly to litellm for structured output
-            _format = response_format
-            system_content = instructions
-
         import logging as _logging
         _log = _logging.getLogger(__name__)
 
         # Resolve max output tokens (get_max_tokens returns context window, not output limit).
         max_tokens = _get_max_output_tokens(_model)
-        _log.info("LLMClient.complete: model=%s max_tokens=%d", _model, max_tokens)
+
+        # Build completion kwargs based on response_format type.
+        #
+        # For Pydantic models we use explicit tool_use (tools + tool_choice) instead of
+        # response_format=PydanticClass. With LiteLLM 1.83+ / Anthropic, passing a Pydantic
+        # model as response_format triggers Anthropic's native structured output mode, which
+        # returns a plain JSON string in message.content. The model then self-terminates the
+        # JSON string when the content contains ASCII " characters (e.g. quoted error messages),
+        # producing a valid but truncated output.
+        #
+        # With tool_use the Anthropic API encodes the arguments server-side, so all characters
+        # including " are properly escaped regardless of what the model generates.
+        completion_kwargs: dict[str, Any] = {"max_tokens": max_tokens, "num_retries": 3}
+
+        if response_format is None or isinstance(response_format, dict):
+            completion_kwargs["response_format"] = response_format or {"type": "json_object"}
+            system_content = instructions + "\n\nRespond with valid JSON only."
+        else:
+            # Pydantic model — use explicit tool_use for server-enforced JSON encoding
+            schema = response_format.model_json_schema()
+            completion_kwargs["tools"] = [
+                {"type": "function", "function": {"name": "structured_output", "parameters": schema}}
+            ]
+            completion_kwargs["tool_choice"] = {"type": "function", "function": {"name": "structured_output"}}
+            system_content = instructions
+
+        _log.info(
+            "LLMClient.complete: model=%s max_tokens=%d mode=%s",
+            _model, max_tokens, "tool_use" if "tools" in completion_kwargs else "json_object",
+        )
 
         start = time.monotonic()
         response = await litellm.acompletion(
@@ -307,9 +325,7 @@ class LLMClient:
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": json.dumps(input_data)},
             ],
-            response_format=_format,
-            max_tokens=max_tokens,
-            num_retries=3,
+            **completion_kwargs,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -330,23 +346,42 @@ class LLMClient:
         except Exception:
             pass
 
+        finish_reason = response.choices[0].finish_reason
+        _log.info(
+            "LLMClient.complete: finish_reason=%s tokens_out=%s",
+            finish_reason,
+            response.usage.completion_tokens if response.usage else "?",
+        )
+
         # 1. Try .parsed (litellm structured output via Pydantic model)
         parsed = getattr(message, "parsed", None)
         if parsed is not None:
+            _log.info("LLMClient.complete: using .parsed path")
             return parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
 
         # 2. Try tool_calls (litellm maps Anthropic tool-use structured output here)
         tool_calls = getattr(message, "tool_calls", None)
         if tool_calls:
-            return json.loads(tool_calls[0].function.arguments)
+            raw = tool_calls[0].function.arguments
+            _log.info("LLMClient.complete: using tool_calls path, raw=%r", raw[:200] if raw else None)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                _log.error("LLMClient.complete: tool_calls JSON parse failed: %s\nFull arguments: %r", e, raw)
+                raise ValueError(f"LLM returned malformed JSON in tool_call arguments: {e}") from e
 
         # 3. Plain content — strip markdown fences if present
         if content:
-            stripped = content.strip()
-            if stripped.startswith("```"):
-                stripped = stripped.split("\n", 1)[-1]
-                stripped = stripped.rsplit("```", 1)[0]
-                content = stripped.strip()
-            return json.loads(content)
+            raw = content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1]
+                raw = raw.rsplit("```", 1)[0]
+                raw = raw.strip()
+            _log.info("LLMClient.complete: using content path, raw=%r", raw[:200])
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                _log.error("LLMClient.complete: content JSON parse failed: %s\nFull content: %r", e, raw)
+                raise ValueError(f"LLM returned malformed JSON in content: {e}") from e
 
-        raise ValueError("LLM returned no content")
+        raise ValueError(f"LLM returned no content (finish_reason={finish_reason!r})")

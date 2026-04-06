@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evalforge-runtime"
-version = "0.1.6"
+version = "0.1.7"
 description = "Runtime engine for EvalForge generated applications"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,7 +27,7 @@ classifiers = [
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
-    "litellm>=1.60.0",
+    "litellm>=1.83.3",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "sqlalchemy>=2.0.0",

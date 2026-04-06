@@ -17,6 +17,23 @@ from evalforge_runtime.types import ExecutionResult, schema_to_model
 logger = logging.getLogger(__name__)
 
 
+def _get_max_output_tokens(model: str) -> int:
+    """Return the max *output* tokens for a model.
+
+    litellm.get_max_tokens() returns the context window (e.g. 200k for Claude),
+    NOT the output limit. We use get_model_info()['max_output_tokens'] instead,
+    capped at 16384 as a safety ceiling, with 8192 as the fallback default.
+    """
+    try:
+        info = litellm.get_model_info(model)
+        out = info.get("max_output_tokens")
+        if out and isinstance(out, int) and out > 0:
+            return min(out, 16384)
+    except Exception:
+        pass
+    return 8192
+
+
 class Executor:
     """Calls an LLM via LiteLLM and tracks cost/latency."""
 
@@ -82,6 +99,12 @@ class Executor:
             response_format = {"type": "json_object"}
             system_content = instructions + "\n\nRespond with valid JSON only."
 
+        # Resolve max output tokens for this model.
+        # litellm.get_max_tokens() returns the context window (e.g. 200k for Claude),
+        # NOT the max output tokens. We need get_model_info()['max_output_tokens'] instead.
+        max_tokens = _get_max_output_tokens(model)
+        logger.info("LLM max_tokens for model '%s': %d", model, max_tokens)
+
         start = time.monotonic()
         response = await litellm.acompletion(
             model=model,
@@ -90,6 +113,8 @@ class Executor:
                 {"role": "user", "content": json.dumps(input_data)},
             ],
             response_format=response_format,
+            max_tokens=max_tokens,
+            num_retries=3,
             metadata={
                 "process_name": process_name,
                 "instructions_version": instructions_hash,

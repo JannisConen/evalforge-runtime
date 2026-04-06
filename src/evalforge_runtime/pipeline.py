@@ -283,7 +283,16 @@ class Pipeline:
                 execution_id=execution_id,
                 request_id=request_id,
             )
-            output = await execution_mod.run(input_data, context)
+            # Deserialize plain dict to typed InputSchema if available
+            input_schema_model = modules.get("input_schema")
+            typed_input: Any = input_data
+            if input_schema_model is not None and isinstance(input_data, dict):
+                try:
+                    typed_input = input_schema_model.model_validate(input_data)
+                    logger.info("Deserialized input_data to %s", input_schema_model.__name__)
+                except Exception as e:
+                    logger.warning("Failed to deserialize input_data to InputSchema: %s — passing raw dict", e)
+            output = await execution_mod.run(typed_input, context)
             logger.info("Custom execution output for '%s': %s", process_name, output)
 
             # Extract LLM tracking from the client (accumulated across all calls)

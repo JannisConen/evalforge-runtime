@@ -30,14 +30,16 @@ class FileInput(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    type: str  # "local", "s3", or "url"
-    key: str  # storage path
+    type: str | None = None  # "local", "s3", or "url" — absent after runtime resolution
+    key: str | None = None  # storage path — absent after runtime resolution
     filename: str  # original filename
     size: int | None = None
     mime_type: str | None = Field(default=None, alias="mimeType")
     extension: str | None = None
-    data: str | None = None  # base64-encoded file content
+    data: str | None = None  # base64-encoded file content (sent by EvalForge test runner)
     url: str | None = None  # absolute download URL
+    path: str | None = None  # local filesystem path (set by runtime after file resolution)
+    content: str | None = None  # pre-decoded text content (populated by runtime for text files)
 
     def file_content(self, encoding: str = "utf-8") -> str:
         """Decode base64 data to string."""
@@ -230,6 +232,24 @@ def schema_to_model(name: str, schema: dict[str, str]) -> type[BaseModel]:
     return create_model(name, **fields)
 
 
+def _get_max_output_tokens(model: str) -> int:
+    """Return the max *output* tokens for a model.
+
+    litellm.get_max_tokens() returns the context window (e.g. 200k for Claude),
+    NOT the output limit. We use get_model_info()['max_output_tokens'] instead,
+    capped at 16384 as a safety ceiling, with 8192 as the fallback default.
+    """
+    try:
+        import litellm
+        info = litellm.get_model_info(model)
+        out = info.get("max_output_tokens")
+        if out and isinstance(out, int) and out > 0:
+            return min(out, 16384)
+    except Exception:
+        pass
+    return 8192
+
+
 class LLMClient:
     """Wrapper for LLM calls available inside ExecutionContext."""
 
@@ -273,6 +293,13 @@ class LLMClient:
             _format = response_format
             system_content = instructions
 
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        # Resolve max output tokens (get_max_tokens returns context window, not output limit).
+        max_tokens = _get_max_output_tokens(_model)
+        _log.info("LLMClient.complete: model=%s max_tokens=%d", _model, max_tokens)
+
         start = time.monotonic()
         response = await litellm.acompletion(
             model=_model,
@@ -281,6 +308,8 @@ class LLMClient:
                 {"role": "user", "content": json.dumps(input_data)},
             ],
             response_format=_format,
+            max_tokens=max_tokens,
+            num_retries=3,
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 

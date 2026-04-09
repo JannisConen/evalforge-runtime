@@ -167,6 +167,7 @@ class Pipeline:
                         "initiator": proc_config.connector_params or {},
                         "process": {"name": process_name, "id": proc_config.process_id},
                         "request_id": request_id,
+                        "input": input_data,
                     }
                     await after_mod.execute(trigger, output)
                     logger.info("After step completed for '%s'", process_name)
@@ -475,6 +476,7 @@ class Pipeline:
                     "initiator": proc_config.connector_params or {},
                     "process": {"name": process_name, "id": proc_config.process_id},
                     "request_id": request_id,
+                    "input": input_data,
                 }
                 await after_mod.execute(trigger, output)
             except Exception as e:

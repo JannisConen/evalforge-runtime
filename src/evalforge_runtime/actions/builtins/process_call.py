@@ -35,8 +35,9 @@ class ProcessCallAction(BaseAction):
         if not target_name:
             raise ValueError("Target process name is required")
 
-        # Build input from field mappings
-        input_data = self._build_input(field_mappings, output)
+        context = kwargs.get("context") or {}
+        # Build input from field mappings — sources may reference output.*, input.*, or context.*
+        input_data = self._build_input(field_mappings, output, context)
 
         # Validate against target's InputSchema if available
         if self._target_input_schema:
@@ -63,7 +64,6 @@ class ProcessCallAction(BaseAction):
             headers["X-API-Key"] = api_key
 
         # Propagate request_id for HITL tracing across process chains
-        context = kwargs.get("context") or {}
         request_id = context.get("request_id")
         if request_id:
             headers["X-Request-ID"] = request_id
@@ -98,10 +98,21 @@ class ProcessCallAction(BaseAction):
             return None
 
     def _build_input(
-        self, field_mappings: list[dict[str, Any]], output: dict[str, Any]
+        self,
+        field_mappings: list[dict[str, Any]],
+        output: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build input dict from field mappings, applying transforms."""
+        """Build input dict from field mappings, applying transforms.
+
+        Source paths support three namespaces:
+        - ``output.<path>`` or bare ``<path>`` — field from this process's output
+        - ``input.<path>`` — field from this process's input (original request)
+        - ``context.<path>`` — value written to context during execution
+        """
         result: dict[str, Any] = {}
+        _context = context or {}
+        input_data: dict[str, Any] = _context.get("input") or {}
 
         for mapping in field_mappings:
             source_path: str = mapping.get("source", "")
@@ -111,7 +122,17 @@ class ProcessCallAction(BaseAction):
             if not source_path or not target_path:
                 continue
 
-            value = self._resolve_path(output, source_path)
+            if source_path.startswith("input."):
+                value = self._resolve_path(input_data, source_path[len("input."):])
+            elif source_path.startswith("context."):
+                value = self._resolve_path(_context, source_path[len("context."):])
+            elif source_path.startswith("output."):
+                value = self._resolve_path(output, source_path[len("output."):])
+            else:
+                raise ValueError(
+                    f"fieldMapping source '{source_path}' must be prefixed with "
+                    f"'output.', 'input.', or 'context.'"
+                )
 
             if transform_code:
                 value = self._apply_transform(transform_code, value, output)

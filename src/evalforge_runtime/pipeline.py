@@ -33,6 +33,48 @@ from evalforge_runtime.types import (
 logger = logging.getLogger(__name__)
 
 
+def _apply_connector_file_aliases(
+    input_data: dict[str, Any],
+    input_schema_model: type | None,
+) -> dict[str, Any]:
+    """Map the connector's generic 'file' key to the InputSchema's FileInput field name.
+
+    Connectors (Gmail, Exchange, etc.) always store the primary file at data["file"].
+    InputSchemas may use any field name (e.g. "email", "document", "attachment").
+    This adds the InputSchema field name as an alias so field mappings like
+    ``input.email`` resolve correctly in after.py process.call actions.
+
+    TODO: revisit this approach. Options to consider:
+    - Teach the agent (via trigger-action-registry.md) that email triggers expose
+      the .eml file at ``input.file``, so generated field mappings use that key directly.
+    - Standardize connectors to always use a well-known key (e.g. always "file"),
+      and update generated InputSchemas to match (field named "file" for email processes).
+    - Keep this runtime alias but make it handle multiple FileInput fields (currently
+      only aliases the first one found).
+    The current approach is pragmatic but hides the mismatch from the agent/developer.
+    """
+    if not isinstance(input_data, dict) or "file" not in input_data:
+        return input_data
+    if input_schema_model is None:
+        return input_data
+
+    from evalforge_runtime.types import FileInput
+
+    for field_name, field_info in input_schema_model.model_fields.items():
+        if field_name == "file":
+            continue
+        annotation = field_info.annotation
+        # Handle both FileInput and Optional[FileInput]
+        args = getattr(annotation, "__args__", ())
+        is_file_input = annotation is FileInput or any(a is FileInput for a in args)
+        if is_file_input and field_name not in input_data:
+            input_data = {**input_data, field_name: input_data["file"]}
+            logger.info("Aliased connector 'file' key to InputSchema field '%s'", field_name)
+            break
+
+    return input_data
+
+
 class Pipeline:
     """Orchestrates three-step execution and process chaining."""
 
@@ -82,6 +124,11 @@ class Pipeline:
         execution_id = execution_id or str(uuid4())
         request_id = request_id or str(uuid4())
         modules = self._modules.get(process_name, {})
+
+        # Alias connector's generic 'file' key to the InputSchema's FileInput field name
+        # so field mappings like input.email work correctly in after.py process.call actions
+        input_data = _apply_connector_file_aliases(input_data, modules.get("input_schema"))
+
         from evalforge_runtime import __version__
 
         session_factory = get_session_factory()

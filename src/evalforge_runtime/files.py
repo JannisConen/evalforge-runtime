@@ -206,6 +206,9 @@ async def _resolve_single(
     local_path = str(storage.base_path / local_key)
 
     result: dict[str, Any] = {
+        # Keep type/key so downstream processes can re-resolve this as a FileRef
+        "type": "local",
+        "key": local_key,
         "filename": filename,
         "path": local_path,
         "mimeType": mime_type,

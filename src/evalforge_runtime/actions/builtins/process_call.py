@@ -10,6 +10,8 @@ import importlib
 import logging
 from typing import Any
 
+import json as _json
+
 import httpx
 
 from evalforge_runtime.actions.base import BaseAction
@@ -136,6 +138,12 @@ class ProcessCallAction(BaseAction):
 
             if transform_code:
                 value = self._apply_transform(transform_code, value, output)
+
+            # Strip resolved-only fields before forwarding — downstream re-resolves from storage.
+            # Passing large decoded content (e.g. full email text) over HTTP can cause
+            # encoding errors on servers with ASCII locale (LANG=C) and inflates payload size.
+            if isinstance(value, dict) and value.get("type") in ("local", "s3", "url") and value.get("key"):
+                value = {k: v for k, v in value.items() if k not in ("content", "path")}
 
             self._set_path(result, target_path, value)
 

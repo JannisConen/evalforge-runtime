@@ -220,8 +220,12 @@ class GmailConnector(Connector):
         headers = {"Authorization": f"Bearer {token}"}
 
         # Add date filter to Gmail search query
+        # Normalize filter value: "unread" → "is:unread" for Gmail API search syntax
+        api_filter = self._filter
+        if api_filter in ("unread", "all"):
+            api_filter = "is:unread" if api_filter == "unread" else ""
         since_date = (datetime.now(timezone.utc) - timedelta(minutes=self._max_age_minutes)).strftime("%Y/%m/%d")
-        query = f"{self._filter} after:{since_date}"
+        query = f"{api_filter} after:{since_date}".strip()
         logger.debug("Gmail API query: %s", query)
 
         async with httpx.AsyncClient() as client:

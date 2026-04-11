@@ -448,6 +448,106 @@ class GmailConnector(Connector):
             logger.info("Reply sent via Gmail API (thread=%s)", thread_id)
 
     # -----------------------------------------------------------------------
+    # Forward
+    # -----------------------------------------------------------------------
+
+    async def forward(self, message_id: str, to: str, body: str = "") -> None:
+        """Forward a message to another recipient."""
+        logger.info("Forwarding message %s to %s", message_id, to)
+        if self._auth_method != "service_account":
+            await self._forward_smtp(message_id, to, body)
+        else:
+            await self._forward_api(message_id, to, body)
+
+    async def _forward_smtp(self, message_id: str, to: str, body: str) -> None:
+        """Forward via SMTP — fetches original via IMAP and re-sends."""
+        def _do_forward() -> None:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(self._mailbox, self.secrets["GMAIL_APP_PASSWORD"])
+            mail.select("INBOX")
+
+            _, msg_data = mail.fetch(message_id.encode(), "(RFC822)")
+            if not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple):
+                raise ValueError(f"Could not fetch original message {message_id}")
+
+            original = email_lib.message_from_bytes(msg_data[0][1])
+            subject = str(original.get("Subject", ""))
+            fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
+
+            import email.mime.multipart
+            fwd = email.mime.multipart.MIMEMultipart()
+            fwd["From"] = self._mailbox
+            fwd["To"] = to
+            fwd["Subject"] = fwd_subject
+
+            if body:
+                fwd.attach(email.mime.text.MIMEText(body, "html"))
+
+            # Attach original as message/rfc822
+            import email.mime.message
+            attached = email.mime.message.MIMEMessage(original)
+            fwd.attach(attached)
+
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(self._mailbox, self.secrets["GMAIL_APP_PASSWORD"])
+                server.send_message(fwd)
+            logger.info("Message %s forwarded via SMTP to %s", message_id, to)
+            mail.logout()
+
+        await asyncio.to_thread(_do_forward)
+
+    async def _forward_api(self, message_id: str, to: str, body: str) -> None:
+        """Forward via Gmail API — fetches raw message and re-sends."""
+        token = await self._acquire_token()
+
+        async with httpx.AsyncClient() as client:
+            # Fetch original metadata for subject
+            resp = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}"
+                f"/messages/{message_id}?format=metadata",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            msg = resp.json()
+            headers_map = {
+                h["name"].lower(): h["value"]
+                for h in msg.get("payload", {}).get("headers", [])
+            }
+            subject = headers_map.get("subject", "")
+            fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
+
+            # Fetch raw RFC822
+            raw_resp = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}"
+                f"/messages/{message_id}?format=raw",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            raw_resp.raise_for_status()
+            raw_bytes = base64.urlsafe_b64decode(raw_resp.json().get("raw", ""))
+
+        original = email_lib.message_from_bytes(raw_bytes)
+
+        import email.mime.multipart
+        import email.mime.message
+        fwd = email.mime.multipart.MIMEMultipart()
+        fwd["to"] = to
+        fwd["subject"] = fwd_subject
+        if body:
+            fwd.attach(email.mime.text.MIMEText(body, "html"))
+        fwd.attach(email.mime.message.MIMEMessage(original))
+
+        raw_fwd = base64.urlsafe_b64encode(fwd.as_bytes()).decode("utf-8")
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}/messages/send",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"raw": raw_fwd},
+            )
+            resp.raise_for_status()
+            logger.info("Message %s forwarded via Gmail API to %s", message_id, to)
+
+    # -----------------------------------------------------------------------
     # Move / Mark read
     # -----------------------------------------------------------------------
 

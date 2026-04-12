@@ -463,6 +463,37 @@ class GmailConnector(Connector):
         else:
             await self._forward_api(message_id, to, body)
 
+    def _build_forward_message(
+        self, original: email_lib.message.Message, to: str, fwd_subject: str, comment: str = ""
+    ) -> email.mime.text.MIMEText | email.mime.multipart.MIMEMultipart:
+        """Build a forward message with inline-quoted body and original attachments re-attached."""
+        import email.mime.multipart
+        import email.mime.base
+
+        html_body = self._build_forward_html(original, comment)
+
+        # Collect attachments from the original
+        attachments = []
+        if original.is_multipart():
+            for part in original.walk():
+                cd = str(part.get("Content-Disposition", ""))
+                if "attachment" in cd:
+                    attachments.append(part)
+
+        if attachments:
+            fwd = email.mime.multipart.MIMEMultipart()
+            fwd["Subject"] = fwd_subject
+            fwd["To"] = to
+            fwd.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
+            for part in attachments:
+                fwd.attach(part)
+        else:
+            fwd = email.mime.text.MIMEText(html_body, "html", "utf-8")
+            fwd["Subject"] = fwd_subject
+            fwd["To"] = to
+
+        return fwd
+
     def _build_forward_html(
         self, original: email_lib.message.Message, comment: str = ""
     ) -> str:
@@ -518,12 +549,8 @@ class GmailConnector(Connector):
             original = email_lib.message_from_bytes(msg_data[0][1])
             subject = str(original.get("Subject", ""))
             fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
-            html_body = self._build_forward_html(original, body)
-
-            fwd = email.mime.text.MIMEText(html_body, "html", "utf-8")
+            fwd = self._build_forward_message(original, to, fwd_subject, body)
             fwd["From"] = self._mailbox
-            fwd["To"] = to
-            fwd["Subject"] = fwd_subject
 
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
                 server.login(self._mailbox, self.secrets["GMAIL_APP_PASSWORD"])
@@ -550,11 +577,8 @@ class GmailConnector(Connector):
         original = email_lib.message_from_bytes(raw_bytes)
         subject = str(original.get("Subject", ""))
         fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
-        html_body = self._build_forward_html(original, body)
-
-        fwd = email.mime.text.MIMEText(html_body, "html", "utf-8")
-        fwd["to"] = to
-        fwd["subject"] = fwd_subject
+        fwd = self._build_forward_message(original, to, fwd_subject, body)
+        fwd["from"] = self._mailbox
 
         raw_fwd = base64.urlsafe_b64encode(fwd.as_bytes()).decode("utf-8")
 

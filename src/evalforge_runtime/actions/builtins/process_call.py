@@ -70,6 +70,13 @@ class ProcessCallAction(BaseAction):
         if request_id:
             headers["X-Request-ID"] = request_id
 
+        # Propagate connector params (e.g. mailbox) so downstream processes can
+        # perform email actions (reply, forward) on behalf of the originating mailbox.
+        # Without this, downstream webhook-triggered processes have no connector context.
+        initiator = context.get("initiator")
+        if initiator:
+            headers["X-Connector-Params"] = _json.dumps(initiator)
+
         logger.info(f"Calling process '{target_name}' at {url}")
 
         async with httpx.AsyncClient(timeout=120) as client:

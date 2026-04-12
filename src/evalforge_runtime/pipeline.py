@@ -112,6 +112,7 @@ class Pipeline:
         trigger: TriggerContext,
         execution_id: str | None = None,
         request_id: str | None = None,
+        initiator: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Execute a single process through the full pipeline.
 
@@ -210,8 +211,17 @@ class Pipeline:
                     after_mod.config["secrets"] = self.secrets
                     after_mod.config["session_factory"] = session_factory
                     after_mod.config["execution_id"] = execution_id
+                    # Use propagated initiator (from process.call chain) when the
+                    # process itself has no connector config (e.g. webhook trigger).
+                    # This lets downstream processes perform email actions on the
+                    # originating mailbox without requiring explicit connector setup.
+                    effective_initiator = (
+                        proc_config.connector_params
+                        or initiator
+                        or {}
+                    )
                     after_mod.config["context"] = {
-                        "initiator": proc_config.connector_params or {},
+                        "initiator": effective_initiator,
                         "process": {"name": process_name, "id": proc_config.process_id},
                         "request_id": request_id,
                         "input": input_data,

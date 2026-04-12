@@ -469,6 +469,17 @@ def _make_process_handler(
         if isinstance(input_data, dict):
             request_id = input_data.pop("_request_id", None) or request_id
 
+        # Extract propagated connector params from process.call chains
+        # (e.g. mailbox for email actions in downstream webhook-triggered processes)
+        connector_params_header = request.headers.get("x-connector-params")
+        propagated_connector_params: dict | None = None
+        if connector_params_header:
+            try:
+                import json as _json
+                propagated_connector_params = _json.loads(connector_params_header)
+            except Exception:
+                pass
+
         # Resolve FileRefs: download from URL or decode base64 data
         input_data = await resolve_file_refs(input_data, execution_id, storage)
 
@@ -485,11 +496,13 @@ def _make_process_handler(
                         output = await pl.execute_process(
                             process_name, input_data, trigger, execution_id,
                             request_id=request_id,
+                            initiator=propagated_connector_params,
                         )
                 else:
                     output = await pl.execute_process(
                         process_name, input_data, trigger, execution_id,
                         request_id=request_id,
+                        initiator=propagated_connector_params,
                     )
 
                 # Fire webhook if configured

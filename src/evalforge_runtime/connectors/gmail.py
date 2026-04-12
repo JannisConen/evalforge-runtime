@@ -463,10 +463,51 @@ class GmailConnector(Connector):
         else:
             await self._forward_api(message_id, to, body)
 
+    def _build_forward_html(
+        self, original: email_lib.message.Message, comment: str = ""
+    ) -> str:
+        """Build an inline-quoted HTML body for forwarding, like Gmail/Outlook do."""
+        from_addr = str(original.get("From", ""))
+        date = str(original.get("Date", ""))
+        subject = str(original.get("Subject", ""))
+        to_addr = str(original.get("To", ""))
+
+        # Extract plain-text or HTML body from original
+        orig_body = ""
+        if original.is_multipart():
+            for part in original.walk():
+                if part.get_content_type() == "text/html":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        orig_body = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                        break
+                if part.get_content_type() == "text/plain" and not orig_body:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                        orig_body = f"<pre>{text}</pre>"
+        else:
+            payload = original.get_payload(decode=True)
+            if payload:
+                text = payload.decode(original.get_content_charset() or "utf-8", errors="replace")
+                orig_body = f"<pre>{text}</pre>" if original.get_content_type() == "text/plain" else text
+
+        quoted = (
+            f'<div style="border-left:2px solid #ccc;padding-left:8px;margin-top:16px;color:#555">'
+            f'<p><b>---------- Forwarded message ----------</b><br>'
+            f'<b>From:</b> {from_addr}<br>'
+            f'<b>Date:</b> {date}<br>'
+            f'<b>Subject:</b> {subject}<br>'
+            f'<b>To:</b> {to_addr}</p>'
+            f'{orig_body}'
+            f'</div>'
+        )
+        return (comment + "<br><br>" if comment else "") + quoted
+
     async def _forward_smtp(self, message_id: str, to: str, body: str) -> None:
-        """Forward via SMTP — fetches original via IMAP and re-sends."""
+        """Forward via SMTP — fetches original via IMAP and inlines content."""
         def _do_forward() -> None:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
             mail.login(self._mailbox, self.secrets["GMAIL_APP_PASSWORD"])
             mail.select("INBOX")
 
@@ -477,22 +518,14 @@ class GmailConnector(Connector):
             original = email_lib.message_from_bytes(msg_data[0][1])
             subject = str(original.get("Subject", ""))
             fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
+            html_body = self._build_forward_html(original, body)
 
-            import email.mime.multipart
-            fwd = email.mime.multipart.MIMEMultipart()
+            fwd = email.mime.text.MIMEText(html_body, "html", "utf-8")
             fwd["From"] = self._mailbox
             fwd["To"] = to
             fwd["Subject"] = fwd_subject
 
-            if body:
-                fwd.attach(email.mime.text.MIMEText(body, "html"))
-
-            # Attach original as message/rfc822
-            import email.mime.message
-            attached = email.mime.message.MIMEMessage(original)
-            fwd.attach(attached)
-
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
                 server.login(self._mailbox, self.secrets["GMAIL_APP_PASSWORD"])
                 server.send_message(fwd)
             logger.info("Message %s forwarded via SMTP to %s", message_id, to)
@@ -501,26 +534,11 @@ class GmailConnector(Connector):
         await asyncio.to_thread(_do_forward)
 
     async def _forward_api(self, message_id: str, to: str, body: str) -> None:
-        """Forward via Gmail API — fetches raw message and re-sends."""
+        """Forward via Gmail API — fetches original and inlines content."""
         token = await self._acquire_token()
 
         async with httpx.AsyncClient() as client:
-            # Fetch original metadata for subject
-            resp = await client.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}"
-                f"/messages/{message_id}?format=metadata",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            resp.raise_for_status()
-            msg = resp.json()
-            headers_map = {
-                h["name"].lower(): h["value"]
-                for h in msg.get("payload", {}).get("headers", [])
-            }
-            subject = headers_map.get("subject", "")
-            fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
-
-            # Fetch raw RFC822
+            # Fetch raw RFC822 for full original content
             raw_resp = await client.get(
                 f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}"
                 f"/messages/{message_id}?format=raw",
@@ -530,15 +548,13 @@ class GmailConnector(Connector):
             raw_bytes = base64.urlsafe_b64decode(raw_resp.json().get("raw", ""))
 
         original = email_lib.message_from_bytes(raw_bytes)
+        subject = str(original.get("Subject", ""))
+        fwd_subject = subject if subject.lower().startswith("fwd:") else f"Fwd: {subject}"
+        html_body = self._build_forward_html(original, body)
 
-        import email.mime.multipart
-        import email.mime.message
-        fwd = email.mime.multipart.MIMEMultipart()
+        fwd = email.mime.text.MIMEText(html_body, "html", "utf-8")
         fwd["to"] = to
         fwd["subject"] = fwd_subject
-        if body:
-            fwd.attach(email.mime.text.MIMEText(body, "html"))
-        fwd.attach(email.mime.message.MIMEMessage(original))
 
         raw_fwd = base64.urlsafe_b64encode(fwd.as_bytes()).decode("utf-8")
 

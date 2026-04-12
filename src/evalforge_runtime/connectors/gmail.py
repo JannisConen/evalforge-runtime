@@ -83,10 +83,11 @@ class GmailConnector(Connector):
     # Token acquisition (Service Account only — App Password uses IMAP/SMTP)
     # -----------------------------------------------------------------------
 
-    async def _acquire_token(self) -> str:
+    async def _acquire_token(self, force_refresh: bool = False) -> str:
         """Acquire access token for Gmail API (service account only)."""
-        if self._token:
+        if self._token and not force_refresh:
             return self._token
+        self._token = None
 
         logger.debug("Acquiring Gmail API token via service account")
         sa_info = json.loads(self.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"])
@@ -216,10 +217,7 @@ class GmailConnector(Connector):
     async def _fetch_api(self) -> list[ConnectorItem]:
         """Fetch messages via Gmail API (service account auth)."""
         logger.debug("Fetching messages via Gmail API for %s", self._mailbox)
-        token = await self._acquire_token()
-        headers = {"Authorization": f"Bearer {token}"}
 
-        # Add date filter to Gmail search query
         # Normalize filter value: "unread" → "is:unread" for Gmail API search syntax
         api_filter = self._filter
         if api_filter in ("unread", "all"):
@@ -228,15 +226,23 @@ class GmailConnector(Connector):
         query = f"{api_filter} after:{since_date}".strip()
         logger.debug("Gmail API query: %s", query)
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}/messages",
-                headers=headers,
-                params={"q": query, "maxResults": 50},
-            )
-            resp.raise_for_status()
-            message_ids = [m["id"] for m in resp.json().get("messages", [])]
-            logger.debug("Gmail API listed %d messages", len(message_ids))
+        for attempt in range(2):
+            token = await self._acquire_token(force_refresh=(attempt > 0))
+            headers = {"Authorization": f"Bearer {token}"}
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/{self._mailbox}/messages",
+                    headers=headers,
+                    params={"q": query, "maxResults": 50},
+                )
+                if resp.status_code == 401 and attempt == 0:
+                    logger.info("Gmail API token expired, refreshing and retrying")
+                    self._token = None
+                    continue
+                resp.raise_for_status()
+                message_ids = [m["id"] for m in resp.json().get("messages", [])]
+                logger.debug("Gmail API listed %d messages", len(message_ids))
+                break
 
         items: list[ConnectorItem] = []
         async with httpx.AsyncClient() as client:

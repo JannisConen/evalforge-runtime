@@ -488,7 +488,11 @@ def _make_process_handler(
         if pl:
             from evalforge_runtime.types import TriggerContext
 
-            trigger = TriggerContext(type="webhook", ref=execution_id)
+            # Use propagated trigger ref if present (e.g. original Gmail message ID
+            # forwarded from an upstream process via process.call). Falls back to the
+            # execution UUID so standalone webhook calls are unaffected.
+            trigger_ref = request.headers.get("x-trigger-ref") or execution_id
+            trigger = TriggerContext(type="webhook", ref=trigger_ref)
             semaphore = get_semaphore() if get_semaphore else None
             try:
                 if semaphore:

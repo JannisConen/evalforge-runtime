@@ -77,6 +77,13 @@ class ProcessCallAction(BaseAction):
         if initiator:
             headers["X-Connector-Params"] = _json.dumps(initiator)
 
+        # Propagate the original trigger ref (e.g. Gmail message ID) so downstream
+        # processes can use email.reply/email.forward against the originating message.
+        # Without this, trigger.ref in the downstream process is the execution UUID,
+        # which the Gmail API rejects with 400 Bad Request.
+        if trigger is not None and getattr(trigger, "ref", None):
+            headers["X-Trigger-Ref"] = str(trigger.ref)
+
         logger.info(f"Calling process '{target_name}' at {url}")
 
         async with httpx.AsyncClient(timeout=120) as client:

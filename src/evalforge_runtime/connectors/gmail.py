@@ -226,6 +226,7 @@ class GmailConnector(Connector):
         query = f"{api_filter} after:{since_date}".strip()
         logger.debug("Gmail API query: %s", query)
 
+        message_ids: list[str] = []
         for attempt in range(2):
             token = await self._acquire_token(force_refresh=(attempt > 0))
             headers = {"Authorization": f"Bearer {token}"}
@@ -240,7 +241,8 @@ class GmailConnector(Connector):
                     self._token = None
                     continue
                 resp.raise_for_status()
-                message_ids = [m["id"] for m in resp.json().get("messages", [])]
+                data = resp.json() if resp.content else {}
+                message_ids = [m["id"] for m in data.get("messages", [])]
                 logger.debug("Gmail API listed %d messages", len(message_ids))
                 break
 
